@@ -28,6 +28,7 @@
          put/3,
          put/5,
          delete/2,
+         delete/3,
          sync/1,
          list_keys/1,
          fold_keys/3, fold_keys/6,
@@ -311,7 +312,11 @@ put(Ref, KeyDirKey, BinKey, Value, TstampExpire) ->
 %% @doc Delete a key from a bitcask datastore.
 -spec delete(reference(), Key::binary()) -> ok.
 delete(Ref, Key) ->
-    put(Ref, Key, tombstone).
+    delete(Ref, Key, Key).
+
+-spec delete(reference(), KeyDirKey::binary(), BinKey::binary()) -> ok.
+delete(Ref, KeyDirKey, BinKey) ->
+    put(Ref, KeyDirKey, BinKey, tombstone, ?DEFAULT_TSTAMP_EXPIRE).
 
 %% @doc Force any writes to sync to disk.
 -spec sync(reference()) -> ok.
