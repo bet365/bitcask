@@ -1041,7 +1041,7 @@ absolute_expire_threshold(Cutoff) ->
     fun(F) ->
             if F#file_status.oldest_tstamp_expire =/= ?DEFAULT_TSTAMP_EXPIRE andalso
                F#file_status.oldest_tstamp_expire < Cutoff  ->
-                    [{data_expired, F#file_status.oldest_tstamp_expire, Cutoff}];
+                    [{keys_expired, F#file_status.oldest_tstamp_expire, Cutoff}];
                true ->
                     []
             end
