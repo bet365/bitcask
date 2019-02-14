@@ -1223,6 +1223,7 @@ scan_key_files([Filename | Rest], KeyDir, Acc, CloseFile, KT) ->
             %% tombstones or data errors.  Otherwise we risk of
             %% reusing the file id for new data.
             _ = bitcask_nifs:increment_file_id(KeyDir, FileTstamp),
+            Now = bitcask_time:tstamp(),
             F = fun({tombstone, K0}, _Tstamp, {_Offset, _TotalSz}, _) ->
                         K = try KT(K0) catch TxErr -> {key_tx_error, TxErr} end,
                         case K of
@@ -1241,15 +1242,19 @@ scan_key_files([Filename | Rest], KeyDir, Acc, CloseFile, KT) ->
                                 error_logger:error_msg("Invalid key on load ~p: ~p",
                                                        [K0, KeyTxErr]);
                             {K1, KeyMeta = #keymeta{}} ->
-                                bitcask_nifs:keydir_put(KeyDir,
-                                                        K1,
-                                                        FileTstamp,
-                                                        TotalSz,
-                                                        Offset,
-                                                        Tstamp,
-                                                        KeyMeta#keymeta.tstamp_expire,
-                                                        bitcask_time:tstamp(),
-                                                        false)
+                                case is_key_expired(KeyMeta#keymeta.tstamp_expire, Now) of
+                                    false ->
+                                        bitcask_nifs:keydir_put(KeyDir,
+                                            K1,
+                                            FileTstamp,
+                                            TotalSz,
+                                            Offset,
+                                            Tstamp,
+                                            KeyMeta#keymeta.tstamp_expire,
+                                            bitcask_time:tstamp(),
+                                            false);
+                                    true ->
+                                        bitcask_nifs:keydir_remove(KeyDir, K1)
                         end,
                         ok
                 end,
@@ -2039,10 +2044,10 @@ get_key_transform(_State) ->
 is_key_expired(0) -> false;
 is_key_expired(ExpireTstamp) ->
     Now = bitcask_time:tstamp(),
-    do_key_expired(ExpireTstamp, Now).
+    is_key_expired(ExpireTstamp, Now).
 
-do_key_expired(ExpireTstamp, Now) when ExpireTstamp < Now -> true;
-do_key_expired(_ExpireTstamp, _Now) -> false.
+is_key_expired(ExpireTstamp, Now) when ExpireTstamp < Now -> true;
+is_key_expired(_ExpireTstamp, _Now) -> false.
 
 -ifdef(TEST).
 error_msg_perhaps(_Fmt, _Args) ->
