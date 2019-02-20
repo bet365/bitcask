@@ -1255,6 +1255,7 @@ scan_key_files([Filename | Rest], KeyDir, Acc, CloseFile, KT) ->
                                             false);
                                     true ->
                                         bitcask_nifs:keydir_remove(KeyDir, K1)
+                                end
                         end,
                         ok
                 end,
