@@ -2047,6 +2047,7 @@ is_key_expired(ExpireTstamp) ->
     Now = bitcask_time:tstamp(),
     is_key_expired(ExpireTstamp, Now).
 
+is_key_expired(0, _Now) -> false;
 is_key_expired(ExpireTstamp, Now) when ExpireTstamp < Now -> true;
 is_key_expired(_ExpireTstamp, _Now) -> false.
 
@@ -3831,7 +3832,7 @@ expired_keys_merge_1_test() ->
             {K1, Meta} = KT(K),
             case Meta#keymeta.tstamp_expire of
                 0 ->
-                    bitcask:put(B, K, V);
+                    bitcask:put(B, K1, K, V, Meta#keymeta.tstamp_expire);
                 _ ->
                     bitcask:put(B, K1, K, V, Meta#keymeta.tstamp_expire)
             end
