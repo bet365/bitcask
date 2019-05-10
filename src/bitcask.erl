@@ -354,32 +354,57 @@ fold_keys(Ref, Fun, Acc0) ->
                 non_neg_integer() | undefined, boolean()) ->
                                                 term() | {error, any()}.
 fold_keys(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
+    fold_keys(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP, false).
+fold_keys(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP, ShowEntriesWithTstampExpire) ->
     %% Fun should be of the form F(#bitcask_entry, A) -> A
     ExpiryTime = expiry_time((get_state(Ref))#bc_state.opts),
-    RealFun = fun(BCEntry, Acc) ->
-        Key = BCEntry#bitcask_entry.key,
-        case BCEntry#bitcask_entry.tstamp < ExpiryTime orelse 
-             is_key_expired(BCEntry#bitcask_entry.tstamp_expire) of
-            true ->
-                Acc;
-            false ->
-                case BCEntry#bitcask_entry.total_sz -
-                            (?HEADER_SIZE + size(Key)) of
-                    Ss when ?IS_TOMBSTONE_SIZE(Ss) ->
-                        %% might be a deleted record, so check
-                        case ?MODULE:get(Ref, Key) of
-                            not_found when not SeeTombstonesP ->
-                                Acc;
-                            not_found when SeeTombstonesP ->
-                                Fun({tombstone, BCEntry}, Acc);
-                            _ -> Fun(BCEntry, Acc)
-                        end;
-                    _ ->
-                        Fun(BCEntry, Acc)
+    RealFun =
+        fun(BCEntry, Acc) ->
+            Key = BCEntry#bitcask_entry.key,
+            Acc0 =
+                case ShowEntriesWithTstampExpire of
+                    true ->
+                        check_expiry_then_get(Ref, Fun, BCEntry, Key, SeeTombstonesP, ExpiryTime, Acc);
+                    false ->
+                        case BCEntry#bitcask_entry.tstamp_expire =:= 0 of
+                            true ->
+                                normal_fetch_bistcask_entry(Ref, Fun, BCEntry, Key, SeeTombstonesP, ExpiryTime, Acc);
+                            false ->
+                                Acc
+                        end
                 end
-        end
-    end,
+        end,
     bitcask_nifs:keydir_fold((get_state(Ref))#bc_state.keydir, RealFun, Acc0, MaxAge, MaxPut).
+
+
+check_expiry_then_get(Ref, Fun, BCEntry, Key, SeeTombstonesP, ExpiryTime, Acc) ->
+    case is_key_expired(BCEntry#bitcask_entry.tstamp_expire) of
+        true ->
+            Acc;
+        false ->
+            normal_fetch_bistcask_entry(Ref, Fun, BCEntry, Key, SeeTombstonesP, ExpiryTime, Acc)
+    end.
+
+normal_fetch_bistcask_entry(Ref, Fun, BCEntry, Key, SeeTombstonesP, ExpiryTime, Acc) ->
+    case BCEntry#bitcask_entry.tstamp < ExpiryTime of
+        false ->
+            case BCEntry#bitcask_entry.total_sz -
+                (?HEADER_SIZE + size(Key)) of
+                Ss when ?IS_TOMBSTONE_SIZE(Ss) ->
+                    %% might be a deleted record, so check
+                    case ?MODULE:get(Ref, Key) of
+                        not_found when not SeeTombstonesP ->
+                            Acc;
+                        not_found when SeeTombstonesP ->
+                            Fun({tombstone, BCEntry}, Acc);
+                        _ -> Fun(BCEntry, Acc)
+                    end;
+                _ ->
+                    Fun(BCEntry, Acc)
+            end;
+        true ->
+            Acc
+    end.
 
 %% @doc fold over all K/V pairs in a bitcask datastore.
 %% Fun is expected to take F(K,V,Acc0) -> Acc
