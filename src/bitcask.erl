@@ -31,7 +31,7 @@
          delete/3,
          sync/1,
          list_keys/1,
-         fold_keys/3, fold_keys/6,
+         fold_keys/3, fold_keys/4, fold_keys/6,
          fold/3, fold/6,
          iterator/3, iterator_next/1, iterator_release/1,
          merge/1, merge/2, merge/3,
@@ -347,6 +347,12 @@ fold_keys(Ref, Fun, Acc0) ->
     MaxPuts = get_opt(max_fold_puts, State#bc_state.opts),
     fold_keys(Ref, Fun, Acc0, MaxAge, MaxPuts, false).
 
+fold_keys(Ref, Fun, Acc0, ShowEntriesWithTstampExpire) ->
+    State = get_state(Ref),
+    MaxAge = get_opt(max_fold_age, State#bc_state.opts) * 1000, % convert from ms to us
+    MaxPuts = get_opt(max_fold_puts, State#bc_state.opts),
+    fold_keys(Ref, Fun, Acc0, MaxAge, MaxPuts, false, ShowEntriesWithTstampExpire).
+
 %% @doc Fold over all keys in a bitcask datastore with limits on how out of date
 %%      the keydir is allowed to be.
 %% Must be able to understand the bitcask_entry record form.
@@ -361,18 +367,17 @@ fold_keys(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP, ShowEntriesWithTstampE
     RealFun =
         fun(BCEntry, Acc) ->
             Key = BCEntry#bitcask_entry.key,
-            Acc0 =
-                case ShowEntriesWithTstampExpire of
-                    true ->
-                        check_expiry_then_get(Ref, Fun, BCEntry, Key, SeeTombstonesP, ExpiryTime, Acc);
-                    false ->
-                        case BCEntry#bitcask_entry.tstamp_expire =:= 0 of
-                            true ->
-                                normal_fetch_bistcask_entry(Ref, Fun, BCEntry, Key, SeeTombstonesP, ExpiryTime, Acc);
-                            false ->
-                                Acc
-                        end
-                end
+            case ShowEntriesWithTstampExpire of
+                true ->
+                    check_expiry_then_get(Ref, Fun, BCEntry, Key, SeeTombstonesP, ExpiryTime, Acc);
+                false ->
+                    case BCEntry#bitcask_entry.tstamp_expire =:= 0 of
+                        true ->
+                            normal_fetch_bistcask_entry(Ref, Fun, BCEntry, Key, SeeTombstonesP, ExpiryTime, Acc);
+                        false ->
+                            Acc
+                    end
+            end
         end,
     bitcask_nifs:keydir_fold((get_state(Ref))#bc_state.keydir, RealFun, Acc0, MaxAge, MaxPut).
 
