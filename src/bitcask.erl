@@ -3796,7 +3796,8 @@ expired_keys_merge_0_test() ->
         end, KVs),
     Data =                           
         fun(L) -> 
-            [filename:join(Dir, integer_to_list(N)++".bitcask.data") || N <- L]                             end,
+            [filename:join(Dir, integer_to_list(N)++".bitcask.data") || N <- L]
+        end,
     %% Any file with an expired key in should need merging - obviously not the current
     %% write file though, which in this case would be 10.
     FilesNeedMerge = Data([8, 6, 4, 2]),
@@ -3860,5 +3861,247 @@ expired_keys_merge_1_test() ->
 			end, [], KVs),
 	ExpectedKeys = [KV || {<<_:32, I:32/integer>>, _V} = KV <- KVs, I rem 2 /= 0],
 	?assertEqual(ExpectedKeys, lists:sort(RemainingKeys)).
+
+
+%% open, close, open
+expired_keys_on_startup_01_test() ->
+    Dir = "/tmp/bc.expire.keys.on.startup.0",
+    os:cmd(?FMT("rm -rf ~s", [Dir])),
+    KT = fun(<<TstampExpire:32/integer, K/binary>>) ->
+        {K, #keymeta{tstamp_expire = TstampExpire}}
+         end,
+    Opts = [{key_transform, KT}, {max_file_size, 20601}, {small_file_threshold, 0}],
+    B = bitcask:open(Dir, [read_write] ++ Opts),
+
+    %% Generate keys alternating between normal and expired.
+    Value = <<0:64/integer-unit:8>>,
+    Expired = bitcask_time:tstamp(),
+    NotExpired = Expired + 1000000,
+    ExpiredDeletes = [ {<<Expired:32/integer, N:32>>, Value} || N <- lists:seq(1,100)],
+    NotExpiredDeletes = [ {<<NotExpired:32/integer, N:32>>, Value} || N <- lists:seq(101,200)],
+    NormalPuts = [ {<<0:32/integer, N:32>>, Value} || N <- lists:seq(201,300)],
+    AllKeyValues = ExpiredDeletes ++ NotExpiredDeletes ++ NormalPuts,
+
+    %% Put the objects into bitcask
+    lists:foreach(
+        fun({K, V}) ->
+            {K1, Meta} = KT(K),
+            case Meta#keymeta.tstamp_expire of
+                0 ->
+                    bitcask:put(B, K, V);
+                _ ->
+                    bitcask:put(B, K1, K, V, Meta#keymeta.tstamp_expire)
+            end
+        end, AllKeyValues),
+
+    Data =
+        fun(L) ->
+            [filename:join(Dir, integer_to_list(N)++".bitcask.data") || N <- L]
+        end,
+
+    %% check keycount is 300
+    State = get_state(B),
+    {KeyCount, _, _, _, _} = bitcask_nifs:keydir_info(State#bc_state.keydir),
+    ?assertEqual(300, KeyCount),
+
+    %% Any file with an expired key in should need merging - obviously not the current
+    %% write file though, which in this case would be 1.
+    FilesNeedMerge = Data([1]),
+    timer:sleep(2000),
+    {true, {ActualFilesNeedMerge, _}} = bitcask:needs_merge(B),
+    ?assertEqual(FilesNeedMerge, ActualFilesNeedMerge),
+
+    %% Check that after closing and reopening that we only have 200 keys remaining.
+    bitcask:close(B),
+    B1 = bitcask:open(Dir, [read_write] ++ Opts),
+    LK = bitcask:list_keys(B1),
+    ?assertEqual(200, length(LK)),
+
+    %% check keycount is 200
+    State = get_state(B1),
+    {KeyCount, _, _, _, _} = bitcask_nifs:keydir_info(State#bc_state.keydir),
+    ?assertEqual(200, KeyCount),
+
+    %% Data integrity check
+    RemainingKeys =
+        lists:foldl(
+            fun({K, V}, A) ->
+                {K1, Meta} = KT(K),
+                case Meta#keymeta.tstamp_expire of
+                    0 ->
+                        {ok, V} = bitcask:get(B1, K1),
+                        [{K, V}|A];
+                    _ ->
+                        A
+                end
+            end, [], AllKeyValues),
+    ExpectedKeyValues = NotExpiredDeletes ++ NormalPuts,
+    ?assertEqual(ExpectedKeyValues, RemainingKeys).
+
+%% open, merge, close, open
+expired_keys_on_startup_02_test() ->
+    Dir = "/tmp/bc.expire.keys.on.startup.1",
+    os:cmd(?FMT("rm -rf ~s", [Dir])),
+    KT = fun(<<TstampExpire:32/integer, K/binary>>) ->
+        {K, #keymeta{tstamp_expire = TstampExpire}}
+         end,
+    Opts = [{key_transform, KT}, {max_file_size, 20601}, {small_file_threshold, 0}],
+    B = bitcask:open(Dir, [read_write] ++ Opts),
+
+    %% Generate keys alternating between normal and expired.
+    Value = <<0:64/integer-unit:8>>,
+    Expired = bitcask_time:tstamp(),
+    NotExpired = Expired + 1000000,
+    ExpiredDeletes = [ {<<Expired:32/integer, N:32>>, Value} || N <- lists:seq(1,100)],
+    NotExpiredDeletes = [ {<<NotExpired:32/integer, N:32>>, Value} || N <- lists:seq(101,200)],
+    NormalPuts = [ {<<0:32/integer, N:32>>, Value} || N <- lists:seq(201,300)],
+    AllKeyValues = ExpiredDeletes ++ NotExpiredDeletes ++ NormalPuts,
+
+    %% Put the objects into bitcask
+    lists:foreach(
+        fun({K, V}) ->
+            {K1, Meta} = KT(K),
+            case Meta#keymeta.tstamp_expire of
+                0 ->
+                    bitcask:put(B, K, V);
+                _ ->
+                    bitcask:put(B, K1, K, V, Meta#keymeta.tstamp_expire)
+            end
+        end, AllKeyValues),
+
+    Data =
+        fun(L) ->
+            [filename:join(Dir, integer_to_list(N)++".bitcask.data") || N <- L]
+        end,
+
+    %% check keycount is 300
+    State = get_state(B),
+    {KeyCount, _, _, _, _} = bitcask_nifs:keydir_info(State#bc_state.keydir),
+    ?assertEqual(300, KeyCount),
+
+    %% Any file with an expired key in should need merging - obviously not the current
+    %% write file though, which in this case would be 1.
+    FilesNeedMerge = Data([1]),
+    timer:sleep(2000),
+    {true, {ActualFilesNeedMerge, _}} = bitcask:needs_merge(B),
+    ?assertEqual(FilesNeedMerge, ActualFilesNeedMerge),
+
+    %% preform bitcask merge
+    bitcask:merge(Dir, Opts),
+    LK = bitcask:list_keys(B),
+    ?assertEqual(200, length(LK)),
+
+    %% Data integrity check
+    RemainingKeys =
+        lists:foldl(
+            fun({K, V}, A) ->
+                {K1, Meta} = KT(K),
+                case Meta#keymeta.tstamp_expire of
+                    0 ->
+                        {ok, V} = bitcask:get(B, K1),
+                        [{K, V}|A];
+                    _ ->
+                        A
+                end
+            end, [], AllKeyValues),
+    ExpectedKeyValues = NotExpiredDeletes ++ NormalPuts,
+    ?assertEqual(ExpectedKeyValues, RemainingKeys),
+
+    %% Check that after closing and reopening that we only have 200 keys remaining.
+    bitcask:close(B),
+    B1 = bitcask:open(Dir, [read_write] ++ Opts),
+    LK1 = bitcask:list_keys(B1),
+    ?assertEqual(200, length(LK1)),
+
+    %% check keycount is 200
+    State = get_state(B1),
+    {KeyCount, _, _, _, _} = bitcask_nifs:keydir_info(State#bc_state.keydir),
+    ?assertEqual(200, KeyCount).
+
+
+%% open, close, open, merge
+expired_keys_on_startup_03_test() ->
+    Dir = "/tmp/bc.expire.keys.on.startup.2",
+    os:cmd(?FMT("rm -rf ~s", [Dir])),
+    KT = fun(<<TstampExpire:32/integer, K/binary>>) ->
+        {K, #keymeta{tstamp_expire = TstampExpire}}
+         end,
+    Opts = [{key_transform, KT}, {max_file_size, 20601}, {small_file_threshold, 0}],
+    B = bitcask:open(Dir, [read_write] ++ Opts),
+
+    %% Generate keys alternating between normal and expired.
+    Value = <<0:64/integer-unit:8>>,
+    Expired = bitcask_time:tstamp(),
+    NotExpired = Expired + 1000000,
+    ExpiredDeletes = [ {<<Expired:32/integer, N:32>>, Value} || N <- lists:seq(1,100)],
+    NotExpiredDeletes = [ {<<NotExpired:32/integer, N:32>>, Value} || N <- lists:seq(101,200)],
+    NormalPuts = [ {<<0:32/integer, N:32>>, Value} || N <- lists:seq(201,300)],
+    AllKeyValues = ExpiredDeletes ++ NotExpiredDeletes ++ NormalPuts,
+
+    %% Put the objects into bitcask
+    lists:foreach(
+        fun({K, V}) ->
+            {K1, Meta} = KT(K),
+            case Meta#keymeta.tstamp_expire of
+                0 ->
+                    bitcask:put(B, K, V);
+                _ ->
+                    bitcask:put(B, K1, K, V, Meta#keymeta.tstamp_expire)
+            end
+        end, AllKeyValues),
+
+    Data =
+        fun(L) ->
+            [filename:join(Dir, integer_to_list(N)++".bitcask.data") || N <- L]
+        end,
+
+    %% check keycount is 300
+    State = get_state(B),
+    {KeyCount, _, _, _, _} = bitcask_nifs:keydir_info(State#bc_state.keydir),
+    ?assertEqual(300, KeyCount),
+
+    %% Any file with an expired key in should need merging - obviously not the current
+    %% write file though, which in this case would be 1.
+    FilesNeedMerge = Data([1]),
+    timer:sleep(2000),
+    {true, {ActualFilesNeedMerge, _}} = bitcask:needs_merge(B),
+    ?assertEqual(FilesNeedMerge, ActualFilesNeedMerge),
+
+    %% Check that after closing and reopening that we only have 200 keys remaining.
+    bitcask:close(B),
+    B1 = bitcask:open(Dir, [read_write] ++ Opts),
+    LK1 = bitcask:list_keys(B1),
+    ?assertEqual(200, length(LK1)),
+
+    %% check keycount is 200
+    State = get_state(B1),
+    {KeyCount, _, _, _, _} = bitcask_nifs:keydir_info(State#bc_state.keydir),
+    ?assertEqual(200, KeyCount),
+
+    %% preform bitcask merge
+    bitcask:merge(Dir, Opts),
+    LK2 = bitcask:list_keys(B1),
+    ?assertEqual(200, length(LK2)),
+
+    %% check keycount is 200
+    State = get_state(B1),
+    {KeyCount, _, _, _, _} = bitcask_nifs:keydir_info(State#bc_state.keydir),
+    ?assertEqual(200, KeyCount),
+
+    %% Data integrity check
+    RemainingKeys =
+        lists:foldl(
+            fun({K, V}, A) ->
+                {K1, Meta} = KT(K),
+                case Meta#keymeta.tstamp_expire of
+                    0 ->
+                        {ok, V} = bitcask:get(B1, K1),
+                        [{K, V}|A];
+                    _ ->
+                        A
+                end
+            end, [], AllKeyValues),
+    ExpectedKeyValues = NotExpiredDeletes ++ NormalPuts,
+    ?assertEqual(ExpectedKeyValues, RemainingKeys).
     
 -endif.
