@@ -3920,22 +3920,20 @@ expired_keys_on_startup_01_test() ->
     ?assertEqual(200, KeyCount1),
 
     %% Data integrity check
-    RemainingKeys =
+    RemainingKeysValues =
         lists:foldl(
             fun({K, V}, A) ->
                 {K1, Meta} = KT(K),
-                case Meta#keymeta.tstamp_expire of
-                    0 ->
-                        {ok, V} = bitcask:get(B1, K1),
-                        [K1|A];
+                case bitcask:get(B1, K1) of
+                    {ok, V} ->
+                        T = Meta#keymeta.tstamp_expire,
+                        [{<<T:32/integer, K1/binary>>, V}|A];
                     _ ->
                         A
                 end
             end, [], AllKeyValues),
     ExpectedKeyValues = NotExpiredDeletes ++ NormalPuts,
-    io:format(user, "~p", [RemainingKeys]),
-    io:format(user, "~n ~p", [ExpectedKeyValues]),
-    ?assertEqual(lists:sort(ExpectedKeyValues), lists:sort(RemainingKeys)).
+    ?assertEqual(lists:sort(ExpectedKeyValues), lists:sort(RemainingKeysValues)).
 
 %% open, merge, close, open
 expired_keys_on_startup_02_test() ->
@@ -3986,20 +3984,20 @@ expired_keys_on_startup_02_test() ->
     ?assertEqual(200, length(LK)),
 
     %% Data integrity check
-    RemainingKeys =
+    RemainingKeysValues =
         lists:foldl(
             fun({K, V}, A) ->
                 {K1, Meta} = KT(K),
-                case Meta#keymeta.tstamp_expire of
-                    0 ->
-                        {ok, V} = bitcask:get(B, K1),
-                        [K1|A];
+                case bitcask:get(B, K1) of
+                    {ok, V} ->
+                        T = Meta#keymeta.tstamp_expire,
+                        [{<<T:32/integer, K1/binary>>, V}|A];
                     _ ->
                         A
                 end
             end, [], AllKeyValues),
     ExpectedKeyValues = NotExpiredDeletes ++ NormalPuts,
-    ?assertEqual(lists:sort(ExpectedKeyValues), lists:sort(RemainingKeys)),
+    ?assertEqual(lists:sort(ExpectedKeyValues), lists:sort(RemainingKeysValues)),
 
     %% Check that after closing and reopening that we only have 200 keys remaining.
     bitcask:close(B),
@@ -4082,19 +4080,19 @@ expired_keys_on_startup_03_test() ->
     ?assertEqual(200, KeyCount2),
 
     %% Data integrity check
-    RemainingKeys =
+    RemainingKeysValues =
         lists:foldl(
             fun({K, V}, A) ->
                 {K1, Meta} = KT(K),
-                case Meta#keymeta.tstamp_expire of
-                    0 ->
-                        {ok, V} = bitcask:get(B1, K1),
-                        [K1|A];
+                case bitcask:get(B1, K1) of
+                    {ok, V} ->
+                        T = Meta#keymeta.tstamp_expire,
+                        [{<<T:32/integer, K1/binary>>, V}|A];
                     _ ->
                         A
                 end
             end, [], AllKeyValues),
     ExpectedKeyValues = NotExpiredDeletes ++ NormalPuts,
-    ?assertEqual(lists:sort(ExpectedKeyValues), lists:sort(RemainingKeys)).
+    ?assertEqual(lists:sort(ExpectedKeyValues), lists:sort(RemainingKeysValues)).
     
 -endif.
