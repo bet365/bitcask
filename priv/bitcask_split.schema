@@ -1,0 +1,137 @@
+%% -*- erlang -*-
+
+%%%% bitcask split
+
+%% @see bitcask.data_root
+{mapping, "split_backend.$name.bitcask.data_root", "riak_kv.split_backend", [
+  hidden,
+  {datatype, directory}
+]}.
+
+%% @see bitcask.open_timeout
+{mapping, "split_backend.$name.bitcask.open_timeout", "riak_kv.split_backend", [
+  {default, "4s"},
+  {datatype, {duration, s}},
+  hidden
+]}.
+
+%% @see bitcask.sync.strategy
+{mapping, "split_backend.$name.bitcask.sync.strategy", "riak_kv.split_backend", [
+  {default, none},
+  {datatype, {enum, [none, o_sync, interval]}},
+  hidden
+]}.
+
+%% @see bitcask.sync.strategy
+{mapping, "split_backend.$name.bitcask.sync.interval", "riak_kv.split_backend", [
+  {datatype, {duration, s}},
+  hidden
+]}.
+
+%% @see bitcask.max_file_size
+{mapping, "split_backend.$name.bitcask.max_file_size", "riak_kv.split_backend", [
+  {default, "2GB"},
+  {datatype, bytesize},
+  hidden
+]}.
+
+%% @see bitcask.merge.policy
+{mapping, "split_backend.$name.bitcask.merge.policy", "riak_kv.split_backend", [
+  {default, always},
+  {datatype, {enum, [always, never, window]}},
+  hidden
+]}.
+
+%% @see bitcask.merge.policy
+{mapping, "split_backend.$name.bitcask.merge.window.start", "riak_kv.split_backend", [
+  {default, 0},
+  {datatype, integer},
+  hidden
+]}.
+
+%% @see bitcask.merge.policy
+{mapping, "split_backend.$name.bitcask.merge.window.end", "riak_kv.split_backend", [
+  {default, 23},
+  {datatype, integer},
+  hidden
+]}.
+
+%% @see bitcask.merge.triggers.fragmentation
+{mapping, "split_backend.$name.bitcask.merge.triggers.fragmentation", "riak_kv.split_backend", [
+  {datatype, integer},
+  hidden,
+  {default, 60},
+  {validators, ["is_percentage"]}
+]}.
+
+%% @see bitcask.merge.triggers.dead_bytes
+{mapping, "split_backend.$name.bitcask.merge.triggers.dead_bytes", "riak_kv.split_backend", [
+  {datatype, bytesize},
+  hidden,
+  {default, "512MB"}
+]}.
+
+
+%% @see bitcask.merge.thresholds.fragmentation
+{mapping, "split_backend.$name.bitcask.merge.thresholds.fragmentation", "riak_kv.split_backend", [
+  {datatype, integer},
+  hidden,
+  {default, 40},
+  {validators, ["is_percentage"]}
+]}.
+
+%% @see bitcask.merge.thresholds.dead_bytes
+{mapping, "split_backend.$name.bitcask.merge.thresholds.dead_bytes", "riak_kv.split_backend", [
+  {datatype, bytesize},
+  hidden,
+  {default, "128MB"}
+]}.
+
+%% @see bitcask.merge.thresholds.small_file
+{mapping, "split_backend.$name.bitcask.merge.thresholds.small_file", "riak_kv.split_backend", [
+  {datatype, bytesize},
+  hidden,
+  {default, "10MB"}
+]}.
+
+%% @see bitcask.fold.max_age
+{mapping, "split_backend.$name.bitcask.fold.max_age", "riak_kv.split_backend", [
+  {datatype, [{atom, unlimited}, {duration, ms}]},
+  hidden,
+  {default, unlimited}
+]}.
+
+%% @see bitcask.fold.max_age
+{mapping, "split_backend.$name.bitcask.fold.max_puts", "riak_kv.split_backend", [
+  {datatype, [integer, {atom, unlimited}]},
+  hidden,
+  {default, 0}
+]}.
+
+%% @see bitcask.expiry
+{mapping, "split_backend.$name.bitcask.expiry", "riak_kv.split_backend", [
+  {datatype, [{atom, off}, {duration, s}]},
+  hidden,
+  {default, off}
+]}.
+
+%% @see bitcask.hintfile_checksums
+{mapping, "split_backend.$name.bitcask.hintfile_checksums", "riak_kv.split_backend", [
+  {default, strict},
+  {datatype, {enum, [strict, allow_missing]}},
+  hidden
+]}.
+
+%% @see bitcask.expiry.grace_time
+{mapping, "split_backend.$name.bitcask.expiry.grace_time", "riak_kv.split_backend", [
+  {datatype, {duration, s}},
+  hidden,
+  {default, 0}
+]}.
+
+%% @see bitcask.io_mode
+{mapping, "split_backend.$name.bitcask.io_mode", "riak_kv.split_backend", [
+  {default, erlang},
+  {datatype, {enum, [erlang, nif]}},
+  hidden
+]}.
