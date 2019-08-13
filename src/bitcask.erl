@@ -1498,12 +1498,14 @@ merge_single_entry(KeyDirKey, BinKey, V, Tstamp, TstampExpire, FileId, {_, _, Of
 merge_single_key_value(KeyDirKey, BinKey, V, Tstamp, TstampExpire, FileId, {_, _, Offset, _} = _Pos, State) ->
     case is_key_expired(TstampExpire) of
         true ->
-            V2 = <<?TOMBSTONE2_STR, FileId:32>>,
+            %% key is expired, we need to place a tombstone infront of it, and remove it from the live keydir
+            %% Remove only if this is the current entry in the keydir
             bitcask_nifs:keydir_remove(State#mstate.live_keydir, KeyDirKey, Tstamp, FileId, Offset),
-            %% Merging only some files, forward tombstone
+            V2 = <<?TOMBSTONE2_STR, FileId:32>>,
             inner_merge_write(KeyDirKey, BinKey, V2, Tstamp, TstampExpire, FileId, Offset, State);
 
         false ->
+            %% key is not expired, merge forward its current value
             ok = bitcask_nifs:keydir_remove(State#mstate.del_keydir, KeyDirKey),
             inner_merge_write(KeyDirKey, BinKey, V, Tstamp, TstampExpire, FileId, Offset, State)
     end.
