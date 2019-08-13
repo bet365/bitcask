@@ -1451,6 +1451,13 @@ merge_single_entry(KeyDirKey, BinKey, V, Tstamp, TstampExpire, FileId, {_, _, Of
             %% that we might have to merge it forward.  The func below
             %% is safe (does nothing) if V is not really a tombstone.
             merge_single_tombstone(KeyDirKey, BinKey, V, Tstamp, TstampExpire, FileId, Offset, State);
+        expired_key ->
+            V2 = <<?TOMBSTONE2_STR, FileId:32>>,
+            bitcask_nifs:keydir_remove(State#mstate.live_keydir, KeyDirKey,
+                                       Tstamp, FileId, Offset),
+            %% Merging only some files, forward tombstone
+            inner_merge_write(KeyDirKey, BinKey, V2, Tstamp, TstampExpire, FileId, Offset,
+                              State);
         expired ->
             %% Note: we drop a tombstone if it expired. Under normal
             %% circumstances it's OK as any value older than that has expired
@@ -1659,10 +1666,13 @@ out_of_date(_State, _Key, _Tstamp, _IsKeyExpired, _FileId, _Pos, _ExpiryTime,
         true -> false;
         false -> not_found
     end;
-out_of_date(_State, _Key, Tstamp, IsKeyExpired, _FileId, _Pos, ExpiryTime,
+out_of_date(_State, _Key, Tstamp, _IsKeyExpired, _FileId, _Pos, ExpiryTime,
             _EverFound, _KeyDirs)
-  when Tstamp < ExpiryTime orelse IsKeyExpired ->
+  when Tstamp < ExpiryTime ->
     expired;
+out_of_date(_State, _Key, _Tstamp, true, _FileId, _Pos, _ExpiryTime,
+            _EverFound, _KeyDirs) ->
+    expired_key;
 out_of_date(State, Key, Tstamp, IsKeyExpired, FileId, {_,_,Offset,_} = Pos,
             ExpiryTime, EverFound, [KeyDir|Rest]) ->
     case bitcask_nifs:keydir_get(KeyDir, Key) of
