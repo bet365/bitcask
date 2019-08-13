@@ -1503,7 +1503,6 @@ merge_single_key_value(KeyDirKey, BinKey, V, Tstamp, TstampExpire, FileId, {_, _
             bitcask_nifs:keydir_remove(State#mstate.live_keydir, KeyDirKey, Tstamp, FileId, Offset),
             V2 = <<?TOMBSTONE2_STR, FileId:32>>,
             inner_merge_write(KeyDirKey, BinKey, V2, Tstamp, TstampExpire, FileId, Offset, State);
-
         false ->
             %% key is not expired, merge forward its current value
             ok = bitcask_nifs:keydir_remove(State#mstate.del_keydir, KeyDirKey),
@@ -3871,136 +3870,139 @@ expired_keys_merge_1_test() ->
 	ExpectedKeys = [KV || {<<_:32, I:32/integer>>, _V} = KV <- KVs, I rem 2 /= 0],
 	?assertEqual(ExpectedKeys, lists:sort(RemainingKeys)).
 
+%% -------------------------------------------------------------------------------------------------------------- %%
+%% Helper functions for Partial Merge Testing
+%% -------------------------------------------------------------------------------------------------------------- %%
+get_entries(Ref) ->
+    FoldFun = fun
+                  (_, <<>>, ACC) -> ACC;
+                  (K, V, ACC) -> [{K,V} | ACC]
+              end,
+    bitcask:fold(Ref, FoldFun, []).
+
+put_entries(Ref, KT, KeyValues) ->
+    lists:foreach(
+        fun({K, V}) ->
+            {K1, Meta} = KT(K),
+            bitcask:put(Ref, K1, K, V, Meta#keymeta.tstamp_expire)
+        end, KeyValues).
+
+delete_entries(Ref, KT, KeyValues) ->
+    lists:foreach(
+        fun({K, _V}) ->
+            {K1, _Meta} = KT(K),
+            bitcask:delete(Ref, K1, K)
+        end, KeyValues).
+
+transform_expected_entries(KT, KeyValues) ->
+    lists:foldl(
+        fun({K, V}, Acc) ->
+            {NewKey, _} = KT(K), [{NewKey, V} | Acc]
+        end,
+        [], KeyValues).
+
+check_partial_merge(Ref, KT, Expected) ->
+    RemainingKeysValues0 = get_entries(Ref),
+    RemainingKeysValues = lists:sort(RemainingKeysValues0),
+    ExpectedKeyValues = lists:sort(transform_expected_entries(KT, Expected)),
+    ?assertEqual(ExpectedKeyValues, RemainingKeysValues).
+
+
+%% -------------------------------------------------------------------------------------------------------------- %%
+%% Partial Merge Testing
+%% -------------------------------------------------------------------------------------------------------------- %%
+
 deleted_keys_partial_merge_test() ->
     Dir = "/tmp/bc.delete.keys.partial.merge",
     os:cmd(?FMT("rm -rf ~s", [Dir])),
     KT = fun(<<TstampExpire:32/integer, K/binary>>) ->
         {K, #keymeta{tstamp_expire = TstampExpire}}
          end,
-    Opts = [{key_transform, KT}, {max_file_size, 10000}, {small_file_threshold, 0}, {max_fold_age, -1}, {max_fold_puts, 0}],
-    B = bitcask:open(Dir, [read_write] ++ Opts),
+    Opts = [{key_transform, KT}, {max_file_size, 9900}, {small_file_threshold, 0}, {max_fold_age, -1}, {max_fold_puts, 0}],
+    B0 = bitcask:open(Dir, [read_write] ++ Opts),
 
     Value = <<0:64/integer-unit:8>>,
     Expired = bitcask_time:tstamp() - 1000,
 
-    NormalPuts = [ {<<0:32/integer, N:32>>, Value} || N <- lists:seq(1, 1000)],
-    ExpiredDeletes = [ {<<Expired:32/integer, N:32>>, Value} || N <- lists:seq(1,400)],
-    AllKeyValues = [X||{_,X} <- lists:sort([ {random:uniform(), N} || N <- NormalPuts])],
-    Expected = [ {<<0:32/integer, N:32>>, Value} || N <- lists:seq(401, 1000)],
-
-    lists:foreach(
-        fun({K, V}) ->
-            {K1, Meta} = KT(K),
-            bitcask:put(B, K1, K, V, Meta#keymeta.tstamp_expire)
-        end, AllKeyValues),
-
-    lists:foreach(
-        fun({K, _V}) ->
-            {K1, _Meta} = KT(K),
-            bitcask:delete(B, K1, K)
-        end, ExpiredDeletes),
-
-    GetKeys =
-        fun(Ref) ->
-            FoldFun = fun
-                          (_, <<>>, ACC) -> ACC;
-                          (K, V, ACC) -> [{K,V} | ACC]
-                      end,
-            bitcask:fold(Ref, FoldFun, [])
-        end,
-
-    TransformExpectedKeys =
-        fun(KeyValues) ->
-            lists:foldl(
-                fun({K, V}, Acc) -> {NewKey, _} = KT(K), [{NewKey, V} | Acc] end,
-                [], KeyValues)
-        end,
-
-    Test =
-        fun(Ref) ->
-            RemainingKeysValues0 = GetKeys(Ref),
-            RemainingKeysValues = lists:sort(RemainingKeysValues0),
-            ExpectedKeyValues = lists:sort(TransformExpectedKeys(Expected)),
-            ExpectedKeyValues == RemainingKeysValues
-        end,
+    NormalPuts1 = [ {<<0:32/integer, N:32>>, Value} || N <- lists:seq(2000, 2050)],
+    NormalPuts2 = [ {<<0:32/integer, N:32>>, Value} || N <- lists:seq(1, 1000)],
+    AllKeyValues1 = [X||{_,X} <- lists:sort([ {random:uniform(), N} || N <- NormalPuts1])],
+    AllKeyValues2 = [X||{_,X} <- lists:sort([ {random:uniform(), N} || N <- NormalPuts2])],
+    ExpiredDeletes2 = [ {<<Expired:32/integer, N:32>>, Value} || N <- lists:seq(1,400)],
+    ExpiredDeletes1 = [ {<<Expired:32/integer, N:32>>, Value} || N <- lists:seq(2000,2025)],
 
 
-    FilesToMerge1 = [begin Dir++"/"++integer_to_list(X)++".bitcask.data" end || X <- lists:seq(10, 14)],
+    Expected = [ {<<0:32/integer, N:32>>, Value} || N <- lists:seq(401, 1000)] ++
+        [ {<<0:32/integer, N:32>>, Value} || N <- lists:seq(2026, 2050)],
+
+    %% file 1
+    put_entries(B0, KT, AllKeyValues1),
+    delete_entries(B0, KT, ExpiredDeletes1),
+    %% file 2 -> 10
+    put_entries(B0, KT, AllKeyValues2),
+    %% file 11 -> 15
+    delete_entries(B0, KT, ExpiredDeletes2),
+
+
+    FilesToMerge1 = [begin Dir++"/"++integer_to_list(X)++".bitcask.data" end || X <- lists:seq(10, 14) ++ [1]],
     bitcask:merge(Dir, Opts, FilesToMerge1),
+    check_partial_merge(B0, KT, Expected),
 
-
-    ?assertEqual(true, Test(B)),
-    bitcask:close(B),
+    bitcask:close(B0),
     B1 = bitcask:open(Dir, [read_write] ++ Opts),
-    ?assertEqual(true, Test(B1)),
+    check_partial_merge(B1, KT, Expected),
+
     FilesToMerge2 = [begin Dir++"/"++integer_to_list(X)++".bitcask.data" end || X <- lists:seq(1, 9)],
     bitcask:merge(Dir, Opts, FilesToMerge2),
-    ?assertEqual(true, Test(B1)).
+    check_partial_merge(B1, KT, Expected).
 
+%% original keys in files 1, 9
+%% overwrite tombstones, and expired puts in files 10, 14
 expired_keys_partial_merge_test() ->
     Dir = "/tmp/bc.expired.keys.partial.merge",
     os:cmd(?FMT("rm -rf ~s", [Dir])),
     KT = fun(<<TstampExpire:32/integer, K/binary>>) ->
         {K, #keymeta{tstamp_expire = TstampExpire}}
          end,
-    Opts = [{key_transform, KT}, {max_file_size, 10000}, {small_file_threshold, 0}, {max_fold_age, -1}, {max_fold_puts, 0}],
-    B = bitcask:open(Dir, [read_write] ++ Opts),
+    Opts = [{key_transform, KT}, {max_file_size, 9900}, {small_file_threshold, 0}, {max_fold_age, -1}, {max_fold_puts, 0}],
+    B0 = bitcask:open(Dir, [read_write] ++ Opts),
 
     Value = <<0:64/integer-unit:8>>,
     Expired = bitcask_time:tstamp() - 1000,
 
-    NormalPuts = [ {<<0:32/integer, N:32>>, Value} || N <- lists:seq(1, 1000)],
-    ExpiredDeletes = [ {<<Expired:32/integer, N:32>>, Value} || N <- lists:seq(1,400)],
-    AllKeyValues = [X||{_,X} <- lists:sort([ {random:uniform(), N} || N <- NormalPuts])],
-    Expected = [ {<<0:32/integer, N:32>>, Value} || N <- lists:seq(401, 1000)],
-
-    lists:foreach(
-        fun({K, V}) ->
-            {K1, Meta} = KT(K),
-            bitcask:put(B, K1, K, V, Meta#keymeta.tstamp_expire)
-        end, AllKeyValues),
-
-    lists:foreach(
-        fun({K, V}) ->
-            {K1, Meta} = KT(K),
-            bitcask:put(B, K1, K, V, Meta#keymeta.tstamp_expire)
-        end, ExpiredDeletes),
-
-    GetKeys =
-        fun(Ref) ->
-            FoldFun = fun
-                          (_, <<>>, ACC) -> ACC;
-                          (K, V, ACC) -> [{K,V} | ACC]
-                      end,
-            bitcask:fold(Ref, FoldFun, [])
-        end,
-
-    TransformExpectedKeys =
-        fun(KeyValues) ->
-            lists:foldl(
-                fun({K, V}, Acc) -> {NewKey, _} = KT(K), [{NewKey, V} | Acc] end,
-                [], KeyValues)
-        end,
-
-    Test =
-        fun(Ref) ->
-            RemainingKeysValues0 = GetKeys(Ref),
-            RemainingKeysValues = lists:sort(RemainingKeysValues0),
-            ExpectedKeyValues = lists:sort(TransformExpectedKeys(Expected)),
-            ExpectedKeyValues == RemainingKeysValues
-        end,
+    NormalPuts1 = [ {<<0:32/integer, N:32>>, Value} || N <- lists:seq(2000, 2050)],
+    NormalPuts2 = [ {<<0:32/integer, N:32>>, Value} || N <- lists:seq(1, 1000)],
+    AllKeyValues1 = [X||{_,X} <- lists:sort([ {random:uniform(), N} || N <- NormalPuts1])],
+    AllKeyValues2 = [X||{_,X} <- lists:sort([ {random:uniform(), N} || N <- NormalPuts2])],
+    ExpiredDeletes2 = [ {<<Expired:32/integer, N:32>>, Value} || N <- lists:seq(1,400)],
+    ExpiredDeletes1 = [ {<<Expired:32/integer, N:32>>, Value} || N <- lists:seq(2000,2025)],
 
 
-    FilesToMerge1 = [begin Dir++"/"++integer_to_list(X)++".bitcask.data" end || X <- lists:seq(10, 14)],
+    Expected = [ {<<0:32/integer, N:32>>, Value} || N <- lists:seq(401, 1000)] ++
+        [ {<<0:32/integer, N:32>>, Value} || N <- lists:seq(2026, 2050)],
+
+    %% file 1
+    put_entries(B0, KT, AllKeyValues1),
+    put_entries(B0, KT, ExpiredDeletes1),
+    %% file 2 -> 10
+    put_entries(B0, KT, AllKeyValues2),
+    %% file 11 -> 15
+    put_entries(B0, KT, ExpiredDeletes2),
+
+    FilesToMerge1 = [begin Dir++"/"++integer_to_list(X)++".bitcask.data" end || X <- lists:seq(11, 15) ++ [1]],
     bitcask:merge(Dir, Opts, FilesToMerge1),
+    check_partial_merge(B0, KT, Expected),
 
-
-    ?assertEqual(true, Test(B)),
-    bitcask:close(B),
+    bitcask:close(B0),
     B1 = bitcask:open(Dir, [read_write] ++ Opts),
-    ?assertEqual(true, Test(B1)),
-    FilesToMerge2 = [begin Dir++"/"++integer_to_list(X)++".bitcask.data" end || X <- lists:seq(1, 9)],
+    check_partial_merge(B1, KT, Expected),
+
+    FilesToMerge2 = [begin Dir++"/"++integer_to_list(X)++".bitcask.data" end || X <- lists:seq(2, 10)],
     bitcask:merge(Dir, Opts, FilesToMerge2),
-    ?assertEqual(true, Test(B1)).
+    check_partial_merge(B1, KT, Expected).
+
+
+
+
     
 -endif.
