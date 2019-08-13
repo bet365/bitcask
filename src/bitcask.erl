@@ -1441,63 +1441,71 @@ merge_files(#mstate {  dirname = Dirname,
              end,
     merge_files(State2#mstate { input_files = Rest }).
 
-merge_single_entry(KeyDirKey, BinKey, V, Tstamp, TstampExpire, FileId, {_, _, Offset, _} = Pos, State) ->
-    case out_of_date(State, KeyDirKey, Tstamp, is_key_expired(TstampExpire), FileId, Pos, State#mstate.expiry_time,
-                     false,
-                     [State#mstate.live_keydir, State#mstate.del_keydir]) of
-        true ->
-            %% Value in keydir is newer, so drop ... except! ...
-            %% We aren't done yet: V might be a tombstone, which means
-            %% that we might have to merge it forward.  The func below
-            %% is safe (does nothing) if V is not really a tombstone.
-            merge_single_tombstone(KeyDirKey, BinKey, V, Tstamp, TstampExpire, FileId, Offset, State);
-        expired_key ->
-            V2 = <<?TOMBSTONE2_STR, FileId:32>>,
-            bitcask_nifs:keydir_remove(State#mstate.live_keydir, KeyDirKey,
-                                       Tstamp, FileId, Offset),
-            %% Merging only some files, forward tombstone
-            inner_merge_write(KeyDirKey, BinKey, V2, Tstamp, TstampExpire, FileId, Offset,
-                              State);
-        expired ->
-            %% Note: we drop a tombstone if it expired. Under normal
-            %% circumstances it's OK as any value older than that has expired
-            %% too and you wouldn't see values coming back to life after a
-            %% merge and reopen.  However with a clock going back in time,
-            %% and badly timed quick merges you could end up seeing an old
-            %% value after we drop a tombstone that has a lower timestamp
-            %% than a value that was actually written before. Likely that other
-            %% value would expire soon too, but...
+merge_single_entry(KeyDirKey, BinKey, V, Tstamp, TstampExpire, FileId, Pos, State) ->
+    OutOfDate = out_of_date(State, KeyDirKey, Tstamp, FileId, Pos, State#mstate.expiry_time,
+        false, [State#mstate.live_keydir, State#mstate.del_keydir]),
+    merge_single_entry(KeyDirKey, BinKey, V, Tstamp, TstampExpire, FileId, Pos, State, OutOfDate).
 
-            %% Remove only if this is the current entry in the keydir
-            bitcask_nifs:keydir_remove(State#mstate.live_keydir, KeyDirKey,
-                                       Tstamp, FileId, Offset),
-            State;
-        not_found ->
-            %% First tombstone seen for this key during this merge
-            merge_single_tombstone(KeyDirKey, BinKey, V, Tstamp, TstampExpire, FileId, Offset, State);
+
+merge_single_entry(KeyDirKey, BinKey, V, Tstamp, TstampExpire, FileId, {_, _, Offset, _} = _Post, State, true) ->
+    %% Value in keydir is newer, so drop ... except! ...
+    %% We aren't done yet: V might be a tombstone, which means
+    %% that we might have to merge it forward.  The func below
+    %% is safe (does nothing) if V is not really a tombstone.
+    merge_single_tombstone(KeyDirKey, BinKey, V, Tstamp, TstampExpire, FileId, Offset, State);
+
+merge_single_entry(KeyDirKey, _BinKey, _V, Tstamp, _TstampExpire, FileId, {_, _, Offset, _} = _Pos, State, expired) ->
+    %% Note: we drop a tombstone if it expired. Under normal
+    %% circumstances it's OK as any value older than that has expired
+    %% too and you wouldn't see values coming back to life after a
+    %% merge and reopen.  However with a clock going back in time,
+    %% and badly timed quick merges you could end up seeing an old
+    %% value after we drop a tombstone that has a lower timestamp
+    %% than a value that was actually written before. Likely that other
+    %% value would expire soon too, but...
+
+    %% Remove only if this is the current entry in the keydir
+    bitcask_nifs:keydir_remove(State#mstate.live_keydir, KeyDirKey, Tstamp, FileId, Offset),
+    State;
+
+merge_single_entry(KeyDirKey, BinKey, V, Tstamp, TstampExpire, FileId, {_, _, Offset, _} = _Pos, State, not_found) ->
+    %% First tombstone seen for this key during this merge
+    merge_single_tombstone(KeyDirKey, BinKey, V, Tstamp, TstampExpire, FileId, Offset, State);
+
+merge_single_entry(KeyDirKey, BinKey, V, Tstamp, TstampExpire, FileId, {_, _, Offset, _} = _Pos, State, false) ->
+    % Either a current value or a tombstone with nothing in the keydir
+    % but an entry in the del keydir because we've seen another during
+    % this merge.
+    case is_tombstone(V) of
+        true ->
+            %% We have seen a tombstone for this key before, but this
+            %% one is newer than that one.
+            ok = bitcask_nifs:keydir_put(State#mstate.del_keydir, KeyDirKey,
+                FileId, 0, Offset, Tstamp, TstampExpire,
+                bitcask_time:tstamp()),
+            case State#mstate.merge_coverage of
+                partial ->
+                    inner_merge_write(KeyDirKey, BinKey, V, Tstamp, TstampExpire, FileId, Offset,
+                        State);
+                _ ->
+                    % Full or prefix merge, safe to drop the tombstone
+                    State
+            end;
         false ->
-            % Either a current value or a tombstone with nothing in the keydir
-            % but an entry in the del keydir because we've seen another during
-            % this merge.
-            case is_tombstone(V) of
-                true ->
-                    %% We have seen a tombstone for this key before, but this
-                    %% one is newer than that one.
-                    ok = bitcask_nifs:keydir_put(State#mstate.del_keydir, KeyDirKey,
-                                                 FileId, 0, Offset, Tstamp, TstampExpire,
-                                                 bitcask_time:tstamp()),
-                    case State#mstate.merge_coverage of
-                        partial ->
-                            inner_merge_write(KeyDirKey, BinKey, V, Tstamp, TstampExpire, FileId, Offset,
-                                              State);
-                        _ ->
-                            % Full or prefix merge, safe to drop the tombstone
-                            State
-                    end;
-                false ->
-                    ok = bitcask_nifs:keydir_remove(State#mstate.del_keydir, KeyDirKey),
-                    inner_merge_write(KeyDirKey, BinKey, V, Tstamp, TstampExpire, FileId, Offset, State)
-            end
+            merge_single_key_value(KeyDirKey, BinKey, V, Tstamp, TstampExpire, FileId, {_, _, Offset, _} = _Pos, State)
+    end.
+
+merge_single_key_value(KeyDirKey, BinKey, V, Tstamp, TstampExpire, FileId, {_, _, Offset, _} = _Pos, State) ->
+    case is_key_expired(TstampExpire) of
+        true ->
+            V2 = <<?TOMBSTONE2_STR, FileId:32>>,
+            bitcask_nifs:keydir_remove(State#mstate.live_keydir, KeyDirKey, Tstamp, FileId, Offset),
+            %% Merging only some files, forward tombstone
+            inner_merge_write(KeyDirKey, BinKey, V2, Tstamp, TstampExpire, FileId, Offset, State);
+
+        false ->
+            ok = bitcask_nifs:keydir_remove(State#mstate.del_keydir, KeyDirKey),
+            inner_merge_write(KeyDirKey, BinKey, V, Tstamp, TstampExpire, FileId, Offset, State)
     end.
 
 merge_single_tombstone(KeyDirKey, BinKey, V, Tstamp, TstampExpire, FileId, Offset, State) ->
@@ -1658,7 +1666,7 @@ inner_merge_write(KeyDirKey, BinKey, V, Tstamp, TstampExpire, OldFileId, OldOffs
     State1#mstate { out_file = Outfile2 }.
 
 
-out_of_date(_State, _Key, _Tstamp, _IsKeyExpired, _FileId, _Pos, _ExpiryTime,
+out_of_date(_State, _Key, _Tstamp, _FileId, _Pos, _ExpiryTime,
             EverFound, []) ->
     %% if we ever found it, and none of the entries were out of date,
     %% then it's not out of date
@@ -1666,18 +1674,15 @@ out_of_date(_State, _Key, _Tstamp, _IsKeyExpired, _FileId, _Pos, _ExpiryTime,
         true -> false;
         false -> not_found
     end;
-out_of_date(_State, _Key, Tstamp, _IsKeyExpired, _FileId, _Pos, ExpiryTime,
+out_of_date(_State, _Key, Tstamp, _FileId, _Pos, ExpiryTime,
             _EverFound, _KeyDirs)
   when Tstamp < ExpiryTime ->
     expired;
-out_of_date(_State, _Key, _Tstamp, true, _FileId, _Pos, _ExpiryTime,
-            _EverFound, _KeyDirs) ->
-    expired_key;
-out_of_date(State, Key, Tstamp, IsKeyExpired, FileId, {_,_,Offset,_} = Pos,
+out_of_date(State, Key, Tstamp, FileId, {_,_,Offset,_} = Pos,
             ExpiryTime, EverFound, [KeyDir|Rest]) ->
     case bitcask_nifs:keydir_get(KeyDir, Key) of
         not_found ->
-            out_of_date(State, Key, Tstamp, IsKeyExpired, FileId, Pos, ExpiryTime,
+            out_of_date(State, Key, Tstamp, FileId, Pos, ExpiryTime,
                         EverFound, Rest);
 
         E when is_record(E, bitcask_entry) ->
@@ -1700,7 +1705,7 @@ out_of_date(State, Key, Tstamp, IsKeyExpired, FileId, {_,_,Offset,_} = Pos,
                                     true;
                                 false ->
                                     out_of_date(
-                                      State, Key, Tstamp, IsKeyExpired, FileId, Pos,
+                                      State, Key, Tstamp, FileId, Pos,
                                       ExpiryTime, true, Rest)
                             end;
 
@@ -1719,13 +1724,13 @@ out_of_date(State, Key, Tstamp, IsKeyExpired, FileId, {_,_,Offset,_} = Pos,
                             %% Thus, we are NOT out of date. Check the
                             %% rest of the keydirs to ensure this
                             %% holds true.
-                            out_of_date(State, Key, Tstamp, IsKeyExpired, FileId, Pos,
+                            out_of_date(State, Key, Tstamp, FileId, Pos,
                                         ExpiryTime, true, Rest)
                     end;
 
                 E#bitcask_entry.tstamp < Tstamp ->
                     %% Not out of date -- check rest of the keydirs
-                    out_of_date(State, Key, Tstamp, IsKeyExpired, FileId, Pos,
+                    out_of_date(State, Key, Tstamp, FileId, Pos,
                                 ExpiryTime, true, Rest);
 
                 true ->
