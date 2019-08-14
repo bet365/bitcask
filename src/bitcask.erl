@@ -152,7 +152,9 @@ open(Dirname, Opts) ->
     WaitTime = timer:seconds(get_opt(open_timeout, Opts)),
 
     %% Set the key transform for this cask
-    KeyTransformFun = get_key_transform(get_opt(key_transform, Opts)),
+    EncodeDiskKeyFun = get_encode_disk_key_fun(get_opt(encode_disk_key, Opts)),
+    DecodeDiskKeyFun = get_decode_disk_key_fun(get_opt(decode_disk_key, Opts)),
+    DecodeDiskKeyOptsDefaults = get_opt(decode_disk_key_default_opts, Opts),
 
     %% Type of tombstone to write, for testing.
     TombstoneVersion = get_opt(tombstone_version, Opts),
@@ -1207,9 +1209,6 @@ get_opt(Key, Opts) ->
 put_state(Ref, State) ->
     erlang:put(Ref, State).
 
-kt_id(Key) when is_binary(Key) ->
-    {Key, #keymeta{}}.
-
 scan_key_files([], _KeyDir, Acc, _CloseFile, _KT) ->
     Acc;
 scan_key_files([Filename | Rest], KeyDir, Acc, CloseFile, KT) ->
@@ -2030,11 +2029,21 @@ expiry_merge([File | Files], LiveKeyDir, KT, Acc0) ->
     end,
     expiry_merge(Files, LiveKeyDir, KT, Acc).
 
-get_key_transform(KT)
-  when is_function(KT) ->
-    KT;
-get_key_transform(_State) ->
-    fun kt_id/1.
+
+default_encode_disk_key_fun(Key) when is_binary(Key) ->
+    Key.
+get_encode_disk_key_fun(Fun) when is_function(Fun) ->
+    Fun;
+get_encode_disk_key_fun(_) ->
+    fun default_encode_disk_key_fun/1.
+
+default_decode_disk_key_fun(Key) when is_binary(Key) ->
+    #keyinfo(key=Key).
+get_decode_disk_key_fun(Fun) when is_function(Fun) ->
+    Fun;
+get_decode_disk_key_fun(_) ->
+    fun default_decode_disk_key_fun/1.
+
 
 is_key_expired(0) -> false;
 is_key_expired(ExpireTstamp) ->
