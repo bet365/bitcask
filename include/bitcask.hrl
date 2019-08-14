@@ -1,6 +1,9 @@
 -define(DEFAULT_TSTAMP_EXPIRE, 0).
 
--record(keymeta, { tstamp_expire = ?DEFAULT_TSTAMP_EXPIRE :: integer() }).
+-record(keyinfo, {
+    key = <<>> :: binary(),
+    tstamp_expire = ?DEFAULT_TSTAMP_EXPIRE :: integer()
+}).
 
 -record(bitcask_entry, { key :: binary(),
                          file_id :: integer(),
