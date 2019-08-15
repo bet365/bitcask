@@ -3872,51 +3872,57 @@ expired_keys_merge_1_test() ->
     Dir = "/tmp/bc.expired.keys.merge1",
     os:cmd(?FMT("rm -rf ~s", [Dir])),
     Now = bitcask_time:tstamp(),
-    KT = fun(<<TstampExpire:32/integer, K/binary>>) -> 
-                 {K, #keymeta{tstamp_expire = TstampExpire}} 
-         end,
-    Opts = [{key_transform, KT}, {max_file_size, 300}, {small_file_threshold, 0}],
-    B = bitcask:open(Dir, [read_write] ++ Opts),
+    EncodeDiskKeyFun =
+        fun(<<K/binary>>, Opts) ->
+            TstampExpire = proplists:get_value(tstamp_expire, Opts, 0),
+            <<TstampExpire:32/integer, K/binary>>
+        end,
+    DecodeDiskKeyFun =
+        fun(<<TstampExpire:32/integer, K/binary>>) ->
+            #keyinfo{key = K, tstamp_expire = TstampExpire}
+        end,
+    BitcaskOpts =
+        [
+            {decode_disk_key_fun, DecodeDiskKeyFun},
+            {encode_disk_key_fun, EncodeDiskKeyFun},
+            {encode_disk_key_default_ops, [{tstamp_expire, 0}]},
+            {max_fold_age, -1},
+            {max_file_size, 1},
+            {small_file_threshold, disabled}
+        ],
+    Ref0 = bitcask:open(Dir, [read_write] ++ BitcaskOpts),
+
     %% Generate keys alternating between normal and expired.
     KVs = [begin
-                case N rem 2 of
-                    0 ->
-                        {<<Now:32/integer, N:32>>, <<0:100/integer-unit:8>>};
-                    _ -> 
-                        {<<0:32/integer, N:32>>, <<0:100/integer-unit:8>>}
-                end
-            end || N <- lists:seq(1,10)],
+               case N rem 2 of
+                   0 ->
+                       {<<N:32>>, <<0:100/integer-unit:8>>, [{tstamp_expire, Now}]};
+                   _ ->
+                       {<<N:32>>, <<0:100/integer-unit:8>>, [{tstamp_expire, 0}]}
+               end
+           end || N <- lists:seq(1,10)],
     lists:foreach(
-        fun({K, V}) -> 
-            {K1, Meta} = KT(K),
-            case Meta#keymeta.tstamp_expire of
-                0 ->
-                    bitcask:put(B, K, V);
-                _ ->
-                    bitcask:put(B, K1, K, V, Meta#keymeta.tstamp_expire)
-            end
+        fun({K, V, Opts}) ->
+            bitcask:put(Ref0, K, V, Opts)
         end, KVs),
     timer:sleep(2000),
     %% Check that after closing and reopening that we only have 5 keys remaining.
-    bitcask:close(B),
-    B1 = bitcask:open(Dir, [read_write] ++ Opts),
-    LK0 = bitcask:list_keys(B1),
+    bitcask:close(Ref0),
+
+    Ref1 = bitcask:open(Dir, [read_write] ++ BitcaskOpts),
+    LK0 = bitcask:list_keys(Ref1),
     ?assertEqual(5, length(LK0)),
-	bitcask:merge(Dir, Opts),
-    LK1 = bitcask:list_keys(B1),
+	bitcask:merge(Dir, BitcaskOpts),
+    LK1 = bitcask:list_keys(Ref1),
     ?assertEqual(5, length(LK1)),
 	RemainingKeys = 
 		lists:foldl(
-			fun({K, V}, A) -> 
-				{K1, Meta} = KT(K),
-				case Meta#keymeta.tstamp_expire of
-					0 ->
-						{ok, V} = bitcask:get(B1, K1),
-						[{K, V}|A];
-					_ ->
-						A
-				end
-			end, [], KVs),
+			fun({K, V}, A) ->
+                case bitcask:get(Ref1, K) of
+                    {ok, V} -> [{K,V} || A];
+                    _ -> A
+                end
+            end, [], KVs),
 	ExpectedKeys = [KV || {<<_:32, I:32/integer>>, _V} = KV <- KVs, I rem 2 /= 0],
 	?assertEqual(ExpectedKeys, lists:sort(RemainingKeys)).
     
