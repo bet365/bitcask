@@ -3917,13 +3917,13 @@ expired_keys_merge_1_test() ->
     ?assertEqual(5, length(LK1)),
 	RemainingKeys = 
 		lists:foldl(
-			fun({K, V}, A) ->
+			fun({K, V, _}, A) ->
                 case bitcask:get(Ref1, K) of
                     {ok, V} -> [{K,V} || A];
                     _ -> A
                 end
             end, [], KVs),
-	ExpectedKeys = [KV || {<<_:32, I:32/integer>>, _V} = KV <- KVs, I rem 2 /= 0],
+	ExpectedKeys = [KV || {<<I:32/integer>>, _V} = KV <- KVs, I rem 2 /= 0],
 	?assertEqual(ExpectedKeys, lists:sort(RemainingKeys)).
     
 -endif.
