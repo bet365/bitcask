@@ -1,5 +1,5 @@
 -define(DEFAULT_TSTAMP_EXPIRE, 0).
-
+-define(TSTAMP_EXPIRE_KEY, tstamp_expire).
 -record(keyinfo, {
     key = <<>> :: binary(),
     tstamp_expire = ?DEFAULT_TSTAMP_EXPIRE :: integer()
