@@ -1,5 +1,11 @@
--define(DEFAULT_TSTAMP_EXPIRE, 0).
 -define(TSTAMP_EXPIRE_KEY, tstamp_expire).
+-define(DEFAULT_TSTAMP_EXPIRE, 0).
+
+-define(DEFAULT_ENCODE_DISK_KEY_OPTS,
+    [
+        {?TSTAMP_EXPIRE_KEY, ?DEFAULT_TSTAMP_EXPIRE}
+    ]).
+
 -record(keyinfo, {
     key = <<>> :: binary(),
     tstamp_expire = ?DEFAULT_TSTAMP_EXPIRE :: integer()
