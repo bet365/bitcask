@@ -294,15 +294,8 @@ put(Ref, Key, Value) ->
 put(Ref, Key, Value, Opts0) ->
     #bc_state { write_file = WriteFile } = State = get_state(Ref),
 
-    Opts = lists:foldl(
-        fun({K, V}, Acc) ->
-            case lists:keymember(K, 1, Acc) of
-                true -> Acc;
-                false -> [{K,V} || Acc]
-            end
-        end,
-        Opts0, ?DEFAULT_ENCODE_DISK_KEY_OPTS),
-
+    %% merge opts and default opts together
+    Opts = lists:ukeymerge(1, lists:sort(Opts0), lists:sort(?DEFAULT_ENCODE_DISK_KEY_OPTS)),
 
     %% Make sure we have a file open to write
     case WriteFile of
@@ -1772,23 +1765,24 @@ do_put(Key, Value, Opts,
         encode_disk_key_fun = EncodeDiskKeyFun
     } = State, Retries, LastErr) ->
 
-    DiskKey =
+    {OkError, Result} =
         try
-            EncodeDiskKeyFun(Key, Opts)
-        catch Type1:Error1 ->
-            throw({unrecoverable, {Type1, Error1}, State})
+            DiskKey0 = EncodeDiskKeyFun(Key, Opts),
+            DiskKeyOverwriteTombstone0 = EncodeDiskKeyFun(Key, ?DEFAULT_ENCODE_DISK_KEY_OPTS),
+            {ok, {DiskKey0, DiskKeyOverwriteTombstone0}}
+        catch Type:Error ->
+            error_logger:error_msg("Error encoding key ~p; opts ~p; error ~p", [Key, Opts, {Type, Error}]),
+            {error, encode_disk_key_error}
         end,
 
-    DiskKeyOverwriteTombstone =
-        try
-            EncodeDiskKeyFun(Key, ?DEFAULT_ENCODE_DISK_KEY_OPTS)
-        catch Type2:Error2 ->
-            throw({unrecoverable, {Type2, Error2}, State})
-        end,
-
-    TstampExpire = proplists:get_value(?TSTAMP_EXPIRE_KEY, Opts, ?DEFAULT_TSTAMP_EXPIRE),
-
-    do_put(Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire, Value, State, Retries, LastErr).
+    case OkError of
+        ok ->
+            {DiskKey, DiskKeyOverwriteTombstone} = Result,
+            TstampExpire = proplists:get_value(?TSTAMP_EXPIRE_KEY, Opts, ?DEFAULT_TSTAMP_EXPIRE),
+            do_put(Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire, Value, State, Retries, LastErr);
+        error ->
+            {error, Result, State}
+    end.
 
 do_put(Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire, Value, #bc_state{write_file = WriteFile} = State,
     Retries, _LastErr) ->
