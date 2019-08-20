@@ -356,7 +356,7 @@ prop_fold_test_() ->
 
 
 get_keydir(Ref) ->
-    element(9, erlang:get(Ref)).    
+    element(10, erlang:get(Ref)).
 
 -endif.
 
