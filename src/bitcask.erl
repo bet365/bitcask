@@ -1765,24 +1765,19 @@ do_put(Key, Value, Opts,
         encode_disk_key_fun = EncodeDiskKeyFun
     } = State, Retries, LastErr) ->
 
-    {OkError, Result} =
+    Result =
         try
             DiskKey0 = EncodeDiskKeyFun(Key, Opts),
             DiskKeyOverwriteTombstone0 = EncodeDiskKeyFun(Key, ?DEFAULT_ENCODE_DISK_KEY_OPTS),
-            {ok, {DiskKey0, DiskKeyOverwriteTombstone0}}
+            {DiskKey0, DiskKeyOverwriteTombstone0}
         catch Type:Error ->
             error_logger:error_msg("Error encoding key ~p; opts ~p; error ~p", [Key, Opts, {Type, Error}]),
-            {error, encode_disk_key_error}
+            throw({unrecoverable, encode_disk_key_error, State})
         end,
 
-    case OkError of
-        ok ->
-            {DiskKey, DiskKeyOverwriteTombstone} = Result,
-            TstampExpire = proplists:get_value(?TSTAMP_EXPIRE_KEY, Opts, ?DEFAULT_TSTAMP_EXPIRE),
-            do_put(Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire, Value, State, Retries, LastErr);
-        error ->
-            {error, Result, State}
-    end.
+    {DiskKey, DiskKeyOverwriteTombstone} = Result,
+    TstampExpire = proplists:get_value(?TSTAMP_EXPIRE_KEY, Opts, ?DEFAULT_TSTAMP_EXPIRE),
+    do_put(Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire, Value, State, Retries, LastErr).
 
 do_put(Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire, Value, #bc_state{write_file = WriteFile} = State,
     Retries, _LastErr) ->
