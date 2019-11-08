@@ -28,7 +28,8 @@
                     ofs :: non_neg_integer(), % Current offset for writing
                     l_ofs=0 :: non_neg_integer(),  % Last offset written to data file
                     l_hbytes=0 :: non_neg_integer(),% Last # bytes written to hint file
-                    l_hintcrc=0 :: non_neg_integer()}). % CRC-32 of current hint prior to last write
+                    l_hintcrc=0 :: non_neg_integer(), % CRC-32 of current hint prior to last write
+                    split=default :: atom()}).
 
 -record(file_status, { filename :: string(),
                       fragmented :: integer(),

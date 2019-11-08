@@ -22,6 +22,7 @@
 -module(bitcask_lockops).
 
 -export([acquire/2,
+        acquire/3,
          release/1,
          delete_stale_lock/2,
          read_activefile/2,
@@ -37,7 +38,9 @@
 %% (merge or write).
 -spec acquire(Type::lock_types(), Dirname::string()) -> {ok, reference()} | {error, any()}.
 acquire(Type, Dirname) ->
-    LockFilename = lock_filename(Type, Dirname),
+    acquire(Type, Dirname, default).
+acquire(Type, Dirname, Split) ->
+    LockFilename = lock_filename(Type, Dirname, Split),
     case bitcask_nifs:lock_acquire(LockFilename, 1) of
         {ok, Lock} ->
             %% Successfully acquired our lock. Update the file with our PID.
@@ -98,9 +101,10 @@ delete_stale_lock(Type, Dirname) ->
 %% ===================================================================
 %% Internal functions
 %% ===================================================================
-
 lock_filename(Type, Dirname) ->
-    filename:join(Dirname, lists:concat(["bitcask.", Type, ".lock"])).
+    lock_filename(Type, Dirname, default).
+lock_filename(Type, Dirname, Split) ->
+    filename:join(Dirname, lists:concat(["bitcask.", Type, ".", Split, ".lock"])).
 
 read_lock_data(Lock) ->
     case bitcask_nifs:lock_readdata(Lock) of

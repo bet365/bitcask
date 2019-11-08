@@ -76,7 +76,7 @@
 
 %% @type bc_state().
 -record(bc_state, {dirname :: string(),
-                   write_file :: 'fresh' | 'undefined' | #filestate{},     % File for writing
+                   write_file :: [#filestate{}],     % File for writing, [write_file]
                    write_lock :: reference(),     % Reference to write lock
                    read_files :: [#filestate{}],     % Files opened for reading
                    max_file_size :: integer(),  % Max. size of a written file
@@ -173,7 +173,7 @@ open(Dirname, Opts) ->
             Ref = make_ref(),
             erlang:put(Ref, #bc_state {dirname = Dirname,
                                        read_files = ReadFiles,
-                                       write_file = WritingFile, % <fd>|undefined|fresh
+                                       write_file = [WritingFile], % <fd>|undefined|fresh
                                        write_lock = undefined,
                                        max_file_size = MaxFileSize,
                                        opts = ExpOpts,
@@ -297,11 +297,14 @@ put(Ref, Key, Value, Opts0) ->
     %% merge opts and default opts together
     Opts = lists:ukeymerge(1, lists:sort(Opts0), lists:sort(?DEFAULT_ENCODE_DISK_KEY_OPTS)),
 
+%%    Split = proplists:get_value(split, Opts, default),
+io:format("Splits: ~p~n", [WriteFile]),
     %% Make sure we have a file open to write
-    case WriteFile of
-        undefined ->
+%%    A = [W || W <- WriteFile, W#filestate.split =:= Split orelse W =:= fresh],
+%%  io:format("Splits2: ~p~n", [A]),
+    case WriteFile of   %% TODO this check needs updating for 'undefined' readonly data for the default split
+        [undefined] ->
             throw({error, read_only});
-
         _ ->
             ok
     end,
@@ -361,7 +364,7 @@ fold_keys(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
     ExpiryTime = expiry_time((get_state(Ref))#bc_state.opts),
     RealFun = fun(BCEntry, Acc) ->
         Key = BCEntry#bitcask_entry.key,
-        case BCEntry#bitcask_entry.tstamp < ExpiryTime orelse 
+        case BCEntry#bitcask_entry.tstamp < ExpiryTime orelse
              is_key_expired(BCEntry#bitcask_entry.tstamp_expire) of
             true ->
                 Acc;
@@ -426,11 +429,11 @@ fold(State, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
 
                                      case K of
                                          {key_tx_error, KeyTxErr1} ->
-                                             error_logger:error_msg("Error converting key ~p: ~p", 
+                                             error_logger:error_msg("Error converting key ~p: ~p",
                                                                     [K0, KeyTxErr1]),
                                              Acc;
                                          #keyinfo{key = K1, tstamp_expire = TstampExpire} ->
-                                             case {K1, (TStamp < ExpiryTime orelse 
+                                             case {K1, (TStamp < ExpiryTime orelse
                                                 is_key_expired(TstampExpire))} of
                                                  {_, true} ->
                                                      Acc;
@@ -1765,6 +1768,8 @@ do_put(Key, Value, Opts,
         encode_disk_key_fun = EncodeDiskKeyFun
     } = State, Retries, LastErr) ->
 
+    Split = proplists:get_value(split, Opts, default),
+
     Result =
         try
             DiskKey0 = EncodeDiskKeyFun(Key, Opts),
@@ -1777,10 +1782,23 @@ do_put(Key, Value, Opts,
 
     {DiskKey, DiskKeyOverwriteTombstone} = Result,
     TstampExpire = proplists:get_value(?TSTAMP_EXPIRE_KEY, Opts, ?DEFAULT_TSTAMP_EXPIRE),
-    do_put(Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire, Value, State, Retries, LastErr).
+    do_put(Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire, Value, State, Retries, LastErr, Split).
 
 do_put(Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire, Value, #bc_state{write_file = WriteFile} = State,
-    Retries, _LastErr) ->
+    Retries, _LastErr, Split) ->
+
+%%    [WF] = [W || W <- WriteFile, W#filestate.split =:= Split orelse W =:= fresh],
+%%    [WF] = case WriteFile of
+%%      [fresh] ->
+%%        [fresh];
+%%      _ ->
+        [WF] = case [W || W <- WriteFile, W#filestate.split =:= Split orelse W =:= fresh] of  %% If put for new split then returns [] so we make it [fresh] to create new file.
+          [] ->
+            [fresh];
+          X ->
+            X
+        end,
+%%    end,
 
     ValSize =
         case Value of
@@ -1790,7 +1808,7 @@ do_put(Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire, Value, #bc_state{w
                 size(Value)
         end,
     State2 =
-        case bitcask_fileops:check_write(WriteFile, DiskKey, ValSize,
+        case bitcask_fileops:check_write(WF, DiskKey, ValSize,
                                          State#bc_state.max_file_size) of
             wrap ->
                 %% Time to start a new write file. Note that we do not
@@ -1798,10 +1816,10 @@ do_put(Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire, Value, #bc_state{w
                 %% is that closing/reopening for read only access
                 %% would flush the O/S cache for the file, which may
                 %% be undesirable.
-                wrap_write_file(State);
+                wrap_write_file(WF, State);
             fresh ->
                 %% Time to start our first write file.
-                case bitcask_lockops:acquire(write, State#bc_state.dirname) of
+                case bitcask_lockops:acquire(write, State#bc_state.dirname, Split) of
                     {ok, WriteLock} ->
                         try
                             {ok, NewWriteFile} = bitcask_fileops:create_file(
@@ -1811,7 +1829,9 @@ do_put(Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire, Value, #bc_state{w
                             ok = bitcask_lockops:write_activefile(
                                    WriteLock,
                                    bitcask_fileops:filename(NewWriteFile)),
-                            State#bc_state{ write_file = NewWriteFile,
+                              NewWriteFile1 = NewWriteFile#filestate{split = Split},
+                              WriteFiles = [W || W <- WriteFile, W#filestate.split =/= fresh],
+                            State#bc_state{ write_file = [NewWriteFile1 | WriteFiles],
                                             write_lock = WriteLock }
                         catch error:{badmatch,Error} ->
                                 throw({unrecoverable, Error, State})
@@ -1825,16 +1845,19 @@ do_put(Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire, Value, #bc_state{w
 
     Tstamp = bitcask_time:tstamp(),
     #bc_state{write_file=WriteFile0} = State2,
-    WriteFileId = bitcask_fileops:file_tstamp(WriteFile0),
+io:format("WriteFile0 : ~p~n", [WriteFile0]),
+    [CorrectFile] = [W || W <- WriteFile0, W#filestate.split =:= Split],
+  io:format("CorrectFile : ~p~n", [CorrectFile]),
+  WriteFileId = bitcask_fileops:file_tstamp(CorrectFile),
     case Value of
         BinValue when is_binary(BinValue) ->
             % Replacing value from a previous file, so write tombstone for it.
-            case bitcask_nifs:keydir_get(State2#bc_state.keydir, Key) of
+            case bitcask_nifs:keydir_get(State2#bc_state.keydir, Key) of          %% TODO BUG: We need to check the returned data is from the split dir, this nif is ignorant to splits when fetching so we need a way to check it on the return or alter the nif to return from the specific dir.
                 #bitcask_entry{file_id=OldFileId}
                   when OldFileId > WriteFileId ->
-                    State3 = wrap_write_file(State2),
+                    State3 = wrap_write_file(CorrectFile, State2),
                     do_put(Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire, Value, State3, Retries - 1,
-                        already_exists);
+                        already_exists, Split);
 
                 #bitcask_entry{file_id=OldFileId,offset=OldOffset} ->
                     State3 =
@@ -1842,20 +1865,21 @@ do_put(Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire, Value, #bc_state{w
                             true ->
                                 PrevTomb = <<?TOMBSTONE2_STR, OldFileId:32>>,
                                 {ok, WriteFile1, _, _} =
-                                    bitcask_fileops:write(WriteFile0, DiskKeyOverwriteTombstone, PrevTomb, Tstamp),
-                                State2#bc_state{write_file = WriteFile1};
+                                    bitcask_fileops:write(CorrectFile, DiskKeyOverwriteTombstone, PrevTomb, Tstamp),
+                                List = lists:delete(CorrectFile, WriteFile0),
+                                State2#bc_state{write_file = [WriteFile1 | List]};
                             false ->
                                 State2
                         end,
                     write_and_keydir_put(State3, Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire,
-                        Value, Tstamp, Retries, bitcask_time:tstamp(), OldFileId, OldOffset);
+                        Value, Tstamp, Retries, bitcask_time:tstamp(), OldFileId, OldOffset, Split);
 
                 _ ->
                     State3 = State2#bc_state{write_file = WriteFile0},
                     write_and_keydir_put(State3, Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire,
-                        Value, Tstamp, Retries, bitcask_time:tstamp(), 0, 0)
+                        Value, Tstamp, Retries, bitcask_time:tstamp(), 0, 0, Split)
             end;
-
+%% TODO this case needs updating with new logic
         tombstone ->
             case bitcask_nifs:keydir_get(State2#bc_state.keydir, Key) of
                 not_found ->
@@ -1863,13 +1887,13 @@ do_put(Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire, Value, #bc_state{w
                 #bitcask_entry{file_id=OldFileId} when OldFileId > WriteFileId ->
                     % A merge wrote this key in a file > current write file
                     % Start a new write file > the merge output file
-                    State3 = wrap_write_file(State2),
+                    State3 = wrap_write_file(CorrectFile, State2),
                     do_put(Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire, Value, State3, Retries - 1,
-                        already_exists);
+                        already_exists, Split);
                 #bitcask_entry{tstamp=OldTstamp, file_id=OldFileId,
                                offset=OldOffset} ->
                     Tombstone = <<?TOMBSTONE2_STR, OldFileId:32>>,
-                    case bitcask_fileops:write(State2#bc_state.write_file, DiskKeyOverwriteTombstone,
+                    case bitcask_fileops:write(CorrectFile, DiskKeyOverwriteTombstone,
                         Tombstone, Tstamp) of
                         {ok, WriteFile2, _, TSize} ->
                             ok = bitcask_nifs:update_fstats(
@@ -1885,13 +1909,12 @@ do_put(Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire, Value, #bc_state{w
                                     %% new file.
                                     {ok, WriteFile3} =
                                         bitcask_fileops:un_write(WriteFile2),
-                                    State3 = wrap_write_file(
-                                               State2#bc_state {
-                                                 write_file = WriteFile3 }),
+                                    State3 = wrap_write_file(WriteFile3, State2),   %% TODO is this the correct logic?
                                     do_put(Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire, Value, State3,
-                                        Retries - 1, already_exists);
+                                        Retries - 1, already_exists, Split);
                                 ok ->
-                                    {ok, State2#bc_state { write_file = WriteFile2 }}
+                                  List = lists:delete(CorrectFile, WriteFile0),
+                                    {ok, State2#bc_state { write_file = [WriteFile2 | List] }}
                             end;
                         {error, _} = ErrorTomb ->
                             throw({unrecoverable, ErrorTomb, State2})
@@ -1900,8 +1923,11 @@ do_put(Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire, Value, #bc_state{w
     end.
 
 write_and_keydir_put(State2, Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire,
-    Value, Tstamp, Retries, NowTstamp, OldFileId, OldOffset) ->
-    case bitcask_fileops:write(State2#bc_state.write_file, DiskKey, Value, Tstamp) of
+    Value, Tstamp, Retries, NowTstamp, OldFileId, OldOffset, Split) ->
+  io:format("State write_file : ~p~n", [State2#bc_state.write_file]),
+  io:format("Split name : ~p~n", [Split]),
+  [WriteFile] = [W || W <- State2#bc_state.write_file, W#filestate.split =:= Split],
+    case bitcask_fileops:write(WriteFile, DiskKey, Value, Tstamp) of
         {ok, WriteFile2, Offset, Size} ->
             case bitcask_nifs:keydir_put(State2#bc_state.keydir, Key,
                                          bitcask_fileops:file_tstamp(WriteFile2),
@@ -1909,7 +1935,8 @@ write_and_keydir_put(State2, Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpi
                                          NowTstamp, true,
                                          OldFileId, OldOffset) of
                 ok ->
-                    {ok, State2#bc_state { write_file = WriteFile2 }};
+                  List = lists:delete(WriteFile, State2#bc_state.write_file),
+                    {ok, State2#bc_state { write_file = [WriteFile2 | List] }};
                 already_exists ->
                     %% Assuming the timestamps in the keydir are
                     %% valid, there is an edge case where the merge thread
@@ -1922,32 +1949,51 @@ write_and_keydir_put(State2, Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpi
                     %% Limit the number of recursions in case there is
                     %% a different issue with the keydir.
                     {ok, WriteFile3} = bitcask_fileops:un_write(WriteFile2),
-                    State3 = wrap_write_file(
-                               State2#bc_state { write_file = WriteFile3 }),
+                    State3 = wrap_write_file(WriteFile3, State2), %% TODO Check if this is the right operation we want to perform
                     do_put(Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire, Value, State3, Retries - 1,
-                        already_exists)
+                        already_exists, Split)
             end;
         Error2 ->
             throw({unrecoverable, Error2, State2})
     end.
 
-wrap_write_file(#bc_state{write_file = WriteFile} = State) ->
-    try
-        LastWriteFile = bitcask_fileops:close_for_writing(WriteFile),
-        {ok, NewWriteFile} = bitcask_fileops:create_file(
-                               State#bc_state.dirname,
-                               State#bc_state.opts,
-                               State#bc_state.keydir),
-        ok = bitcask_lockops:write_activefile(
-               State#bc_state.write_lock,
-               bitcask_fileops:filename(NewWriteFile)),
-        State#bc_state{ write_file = NewWriteFile,
-                        read_files = [LastWriteFile |
-                                      State#bc_state.read_files]}
-    catch
-        error:{badmatch,Error} ->
-            throw({unrecoverable, Error, State})
-    end.
+%%wrap_write_file(#bc_state{write_file = WriteFile} = State) ->
+%%    try
+%%        LastWriteFile = bitcask_fileops:close_for_writing(WriteFile),
+%%        {ok, NewWriteFile} = bitcask_fileops:create_file(
+%%                               State#bc_state.dirname,
+%%                               State#bc_state.opts,
+%%                               State#bc_state.keydir),
+%%        ok = bitcask_lockops:write_activefile(
+%%               State#bc_state.write_lock,
+%%               bitcask_fileops:filename(NewWriteFile)),
+%%        State#bc_state{ write_file = NewWriteFile,
+%%                        read_files = [LastWriteFile |
+%%                                      State#bc_state.read_files]}
+%%    catch
+%%        error:{badmatch,Error} ->
+%%            throw({unrecoverable, Error, State})
+%%    end.
+
+wrap_write_file(WF, #bc_state{write_file = OldWriteFile} = State) ->
+  try
+    LastWriteFile = bitcask_fileops:close_for_writing(WF),
+    {ok, NewWriteFile} = bitcask_fileops:create_file(
+      State#bc_state.dirname,
+      State#bc_state.opts,
+      State#bc_state.keydir),
+    ok = bitcask_lockops:write_activefile(
+      State#bc_state.write_lock,
+      bitcask_fileops:filename(NewWriteFile)),
+      NewWriteFile1 = NewWriteFile#filestate{split = WF#filestate.split},
+    UpdatedWriteFiles = lists:delete(WF, OldWriteFile),
+    State#bc_state{ write_file = [NewWriteFile1 | UpdatedWriteFiles],
+      read_files = [LastWriteFile |
+        State#bc_state.read_files]}
+  catch
+    error:{badmatch,Error} ->
+      throw({unrecoverable, Error, State})
+  end.
 
 %% Versions of Bitcask prior to
 %% https://github.com/basho/bitcask/pull/156 used the setuid bit to
@@ -3844,7 +3890,7 @@ expired_keys_merge_0_test() ->
                 case N rem 2 of
                     0 ->
                         {<<N:32>>, <<0:100/integer-unit:8>>, [{?TSTAMP_EXPIRE_KEY, Now}]};
-                    _ -> 
+                    _ ->
                         {<<N:32>>, <<0:100/integer-unit:8>>, []}
                 end
             end || N <- lists:seq(1,10)],
@@ -3852,8 +3898,8 @@ expired_keys_merge_0_test() ->
         fun({K, V, Opts}) ->
             bitcask:put(Ref0, K, V, Opts)
         end, KVs),
-    Data =                           
-        fun(L) -> 
+    Data =
+        fun(L) ->
             [filename:join(Dir, integer_to_list(N)++".bitcask.data") || N <- L]
         end,
     %% Any file with an expired key in should need merging - obviously not the current
@@ -3916,7 +3962,7 @@ expired_keys_merge_1_test() ->
 	bitcask:merge(Dir, BitcaskOpts),
     LK1 = bitcask:list_keys(Ref1),
     ?assertEqual(5, length(LK1)),
-	RemainingKeys = 
+	RemainingKeys =
 		lists:foldl(
 			fun({K, V, _}, A) ->
                 case bitcask:get(Ref1, K) of
@@ -4213,5 +4259,5 @@ expired_keys_partial_merge_1_test() ->
     bitcask:merge(Dir, BitcaskOpts, FilesToMerge2),
     check_partial_merge(Ref1, Expected),
     bitcask:close(Ref1).
-    
+
 -endif.
