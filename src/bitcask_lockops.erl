@@ -25,7 +25,10 @@
         acquire/3,
          release/1,
          delete_stale_lock/2,
+         fetch_lock/2,
+         fetch_lock/3,
          read_activefile/2,
+         read_activefile/3,
          write_activefile/2]).
 
 -ifdef(PULSE).
@@ -41,6 +44,7 @@ acquire(Type, Dirname) ->
     acquire(Type, Dirname, default).
 acquire(Type, Dirname, Split) ->
     LockFilename = lock_filename(Type, Dirname, Split),
+%%    io:format("LockFile name: ~p~n", [LockFilename]),
     case bitcask_nifs:lock_acquire(LockFilename, 1) of
         {ok, Lock} ->
             %% Successfully acquired our lock. Update the file with our PID.
@@ -69,10 +73,43 @@ acquire(Type, Dirname, Split) ->
 release(Lock) ->
     bitcask_nifs:lock_release(Lock).
 
+fetch_lock(Type, Dirname) ->
+    fetch_lock(Type, Dirname, default).
+fetch_lock(Type, Dirname, Split) ->
+    LockeFileName = lock_filename(Type, Dirname, Split),
+    case bitcask_nifs:lock_acquire(LockeFileName, 0) of
+        {ok, Lock} ->
+            try
+                {ok, Lock}
+            after
+                bitcask_nifs:lock_release(Lock)
+            end;
+        {error, _} ->
+            undefined
+    end.
+
 %% @doc Read the active filename stored in a given lockfile.
 -spec read_activefile(Type::lock_types(), Dirname::string()) -> string() | undefined.
 read_activefile(Type, Dirname) ->
     LockFilename = lock_filename(Type, Dirname),
+    case bitcask_nifs:lock_acquire(LockFilename, 0) of
+        {ok, Lock} ->
+            try
+                case read_lock_data(Lock) of
+                    {ok, _Pid, ActiveFile} ->
+                        ActiveFile;
+                    _ ->
+                        undefined
+                end
+            after
+                bitcask_nifs:lock_release(Lock)
+            end;
+        {error, _Reason} ->
+            undefined
+    end.
+
+read_activefile(Type, Dirname, Split) ->
+    LockFilename = lock_filename(Type, Dirname, Split),
     case bitcask_nifs:lock_acquire(LockFilename, 0) of
         {ok, Lock} ->
             try
