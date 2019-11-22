@@ -81,6 +81,9 @@
 -define(VERSION_2, 2).
 -define(VERSION_3, 3).
 
+-define(ENCODE_BITCASK_KEY, fun make_bitcask_key/3).
+-define(DECODE_BITCASK_KEY, fun make_riak_key/1).
+
 %% @type bc_state().
 -record(bc_state, {dirname :: string(),
                    write_file :: [#filestate{}],     % File for writing, [write_file]
@@ -90,6 +93,8 @@
                    opts :: list(),           % Original options used to open the bitcask
                    encode_disk_key_fun :: function(),
                    decode_disk_key_fun :: function(),
+                   encode_riak_key_fun :: function(),
+                   decode_riak_key_fun :: function(),
                    keydir :: reference(),       % Key directory
                    read_write_p :: integer(),    % integer() avoids atom -> NIF
                    % What tombstone style to write, for testing purposes only.
@@ -163,6 +168,8 @@ open(Dirname, Opts) ->
     EncodeDiskKeyFun = get_encode_disk_key_fun(get_opt(encode_disk_key_fun, Opts)),
     DecodeDiskKeyFun = get_decode_disk_key_fun(get_opt(decode_disk_key_fun, Opts)),
 
+    EncodeRiakKeyFun = get_encode_riak_key_fun(get_opt(encode_riak_key, Opts)),
+    DecodeRiakKeyFun = get_decode_riak_key_fun(get_opt(decode_riak_key, Opts)),
 
     %% Type of tombstone to write, for testing.
     TombstoneVersion = get_opt(tombstone_version, Opts),
@@ -174,7 +181,7 @@ open(Dirname, Opts) ->
                  end,
     case init_keydir(Dirname, WaitTime, ReadWriteP, DecodeDiskKeyFun) of
         {ok, KeyDir, ReadFiles} ->
-          io:format("ReadFiles after an open: ~p~n", [ReadFiles]),
+%%          io:format("ReadFiles after an open: ~p~n", [ReadFiles]),
             %% Ensure that expiry_secs is in Opts and not just application env
             ExpOpts = [{expiry_secs,get_opt(expiry_secs,Opts)}|Opts],
 
@@ -188,6 +195,8 @@ open(Dirname, Opts) ->
                                        keydir = KeyDir,
                                        encode_disk_key_fun = EncodeDiskKeyFun,
                                        decode_disk_key_fun = DecodeDiskKeyFun,
+                                       encode_riak_key_fun = EncodeRiakKeyFun,
+                                       decode_riak_key_fun = DecodeRiakKeyFun,
                                        tombstone_version = TombstoneVersion,
                                        read_write_p = ReadWriteI}),
             Ref;
@@ -250,7 +259,6 @@ get(Ref, {Bucket, Key, Split}, TryNum) ->
   BitcaskKey = make_bitcask_key(3, {Bucket, Split}, Key),
   get(Ref, BitcaskKey, TryNum);
 get(Ref, Key, TryNum) ->
-    io:format("================================================  Get Ref: ~p, Key: ~p~n", [Ref, Key]),
     State = get_state(Ref),
     case bitcask_nifs:keydir_get(State#bc_state.keydir, Key) of
         not_found ->
@@ -305,9 +313,10 @@ put(Ref, Key, Value) ->
     put(Ref, Key, Value, ?DEFAULT_ENCODE_DISK_KEY_OPTS).
 put(Ref, {Bucket, Key}, Value, Opts0) ->
   Split = proplists:get_value(split, Opts0, default),
-  BitCaskKey = make_bitcask_key(3, {Bucket, atom_to_binary(Split, latin1)}, Key),
-  put(Ref, BitCaskKey, Value, Opts0);
+  BitcaskKey = make_bitcask_key(3, {Bucket, atom_to_binary(Split, latin1)}, Key),
+  put(Ref, BitcaskKey, Value, Opts0);
 put(Ref, Key, Value, Opts0) ->
+%%    io:format("Put Key encoded: ~p and decoded: ~p~n", [Key, make_riak_key(Key)]),
     #bc_state { write_file = WriteFile } = State = get_state(Ref),
 %%  {Bucket, Key1} = Key,
 %%  Split = proplists:get_value(split, Opts0, default),
@@ -317,7 +326,7 @@ put(Ref, Key, Value, Opts0) ->
     Opts = lists:ukeymerge(1, lists:sort(Opts0), lists:sort(?DEFAULT_ENCODE_DISK_KEY_OPTS)),
 
 %%    Split = proplists:get_value(split, Opts, default),
-io:format("Splits: ~p~n", [WriteFile]),
+
     %% Make sure we have a file open to write
 %%    A = [W || W <- WriteFile, W#filestate.split =:= Split orelse W =:= fresh],
 %%  io:format("Splits2: ~p~n", [A]),
@@ -596,6 +605,7 @@ iterator_release(Ref) ->
 %%      into a more compact form.
 -spec merge(Dirname::string()) -> ok | {error, any()}.
 merge(Dirname) ->
+    io:format("############################################################### Merging Dirname: ~p~n", [Dirname]),
     merge(Dirname, []).
 
 %% @doc Merge several data files within a bitcask datastore
@@ -744,10 +754,11 @@ merge1(Dirname, Opts, FilesToMerge0, ExpiredFiles) ->
                       read_write_p = 0,
                       opts = Opts,
                       delete_files = []},
-
+%%io:format("Initial state for merge requests: ~p~n", [State]),
     %% Finally, start the merge process
     ExpiredFilesFinished = expiry_merge(InExpiredFiles, LiveKeyDir, DecodeDiskKeyFun, []),
     State1 = merge_files(State),
+%%    io:format("State after merge: ~p~n", [State1]),
 
     %% Make sure to close the final output file
     case State1#mstate.out_file of
@@ -1213,7 +1224,6 @@ start_app() ->
 -endif.
 
 get_state(Ref) ->
-    io:format("=======================================================   getting state for ref: ~p~n", [Ref]),
     case erlang:get(Ref) of
         S when is_record(S, bc_state) ->
             S;
@@ -1267,7 +1277,7 @@ scan_key_files([Filename | Rest], KeyDir, Acc, CloseFile, DecodeDiskKeyFun) ->
                                 error_logger:error_msg("Invalid key on load ~p: ~p",
                                                        [K0, KeyTxErr]);
                             #keyinfo{key = K1, tstamp_expire = TstampExpire} ->
-                              io:format("~nKey to be populated: ~p~n", [make_riak_key(K1)]),
+%%                              io:format("~nKey to be populated: ~p~n", [make_riak_key(K1)]),
                                 case is_key_expired(TstampExpire, Now) of
                                     false ->
                                         bitcask_nifs:keydir_put(KeyDir,
@@ -1285,7 +1295,7 @@ scan_key_files([Filename | Rest], KeyDir, Acc, CloseFile, DecodeDiskKeyFun) ->
                         end,
                         ok
                 end,
-          io:format("Are we getting this far as part of the open? Using File: ~p and F: ~p~n", [File, F]),
+%%          io:format("Are we getting this far as part of the open? Using File: ~p and F: ~p~n", [File, F]),
             bitcask_fileops:fold_keys(File, F, undefined, recovery),
             if CloseFile == true ->
                     bitcask_fileops:close(File);
@@ -1463,7 +1473,7 @@ merge_files(#mstate {  dirname = Dirname,
                 end
         end,
     State2 = try bitcask_fileops:fold(File, F, State) of
-                 #mstate{delete_files = DelFiles} = State1 ->     %% TODO Can this logic be moved into the fun above after the merge_single_enttry.
+                 #mstate{delete_files = DelFiles} = State1 ->     %% TODO Can this logic be moved into the fun above after the merge_single_entry.
                                                                   %% TODO We'd have the key to decode find the split and be able to the File = #filestate{} record too
                      State1#mstate{delete_files = [File|DelFiles]}
              catch
@@ -1473,6 +1483,7 @@ merge_files(#mstate {  dirname = Dirname,
                        [File#filestate.filename, Dirname, Error]),
                      State
              end,
+%%    io:format("State after running merge func: ~p~n", [State2]),
     merge_files(State2#mstate { input_files = Rest }).
 
 merge_single_entry(KeyDirKey, DiskKey, V, Tstamp, TstampExpire, FileId, {_, _, Offset, _} = Pos, State) ->
@@ -1604,9 +1615,9 @@ inner_merge_write(KeyDirKey, DiskKey, V, Tstamp, TstampExpire, OldFileId, OldOff
 %%    io:format("inner merge state: ~p~n", [State]),
     Split = case make_riak_key(KeyDirKey) of
                 {{S, _, _}, _} ->
-                    S;
+                    binary_to_atom(S, latin1);
                 {{S, _}, _} ->
-                    S;
+                    binary_to_atom(S, latin1);
                 _S ->
                     default
             end,
@@ -1638,7 +1649,8 @@ inner_merge_write(KeyDirKey, DiskKey, V, Tstamp, TstampExpire, OldFileId, OldOff
                        State#mstate.merge_lock,
                        NewFileName),
                 NewOutfiles = lists:delete(fresh, State#mstate.out_file),
-                State#mstate { out_file = [NewFile1 | NewOutfiles] };
+                NewOutfiles1 = lists:delete(OutFile, NewOutfiles),
+                State#mstate { out_file = [NewFile1 | NewOutfiles1] };
             ok ->
                 State;
             fresh ->
@@ -1706,6 +1718,7 @@ inner_merge_write(KeyDirKey, DiskKey, V, Tstamp, TstampExpire, OldFileId, OldOff
                 end
         end,
     NewOutList = lists:delete(OutFile1, State1#mstate.out_file),
+%%    io:format("Final outfile: ~p being added to NewOutList: ~p~n", [Outfile2, NewOutList]),
     State1#mstate { out_file = [Outfile2| NewOutList] }.
 
 
@@ -1784,27 +1797,31 @@ out_of_date(State, Key, Tstamp, IsKeyExpired, FileId, {_,_,Offset,_} = Pos,
 
 -spec readable_files(string()) -> [string()].
 readable_files(Dirname) ->
-    {ReadableFiles, _SetuidFiles} = readable_and_setuid_files(Dirname),
+    readable_files(Dirname, default).
+readable_files(Dirname, Split) ->
+    {ReadableFiles, _SetuidFiles} = readable_and_setuid_files(Dirname, Split),
     ReadableFiles.
 
 readable_and_setuid_files(Dirname) ->
+    readable_and_setuid_files(Dirname, default).
+readable_and_setuid_files(Dirname, Split) ->
     %% Check the write and/or merge locks to see what files are currently
     %% being written to. Generate our list excepting those.
-    WritingFile = bitcask_lockops:read_activefile(write, Dirname),
-    MergingFile = bitcask_lockops:read_activefile(merge, Dirname),
+    WritingFile = bitcask_lockops:read_activefile(write, Dirname, Split),
+    MergingFile = bitcask_lockops:read_activefile(merge, Dirname, Split),
 
     %% Filter out files with setuid bit set: they've been marked for
     %% deletion by an earlier *successful* merge.
     Fs = [F || F <- list_data_files(Dirname, WritingFile, MergingFile)],
 
-    WritingFile2 = bitcask_lockops:read_activefile(write, Dirname),
-    MergingFile2 = bitcask_lockops:read_activefile(merge, Dirname),
+    WritingFile2 = bitcask_lockops:read_activefile(write, Dirname, Split),
+    MergingFile2 = bitcask_lockops:read_activefile(merge, Dirname, Split),
     case {WritingFile2, MergingFile2} of
         {WritingFile, MergingFile} ->
             lists:partition(fun(F) -> not has_pending_delete_bit(F) end, Fs);
         _ ->
             % Changed while fetching file list, retry
-            readable_and_setuid_files(Dirname)
+            readable_and_setuid_files(Dirname, Split)
     end.
 
 %% Internal put - have validated that the file is opened for write
@@ -1835,7 +1852,6 @@ do_put(Key, Value, Opts,
 
 do_put(Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire, Value, #bc_state{write_file = WriteFile, write_lock = WriteLocks} = State,
     Retries, _LastErr, Split) ->
-
     [WF] =
         case [W || W <- WriteFile, W#filestate.split =:= Split orelse W =:= fresh] of  %% If put for new split then returns [] so we make it [fresh] to create new file.
             [] ->
@@ -1843,7 +1859,7 @@ do_put(Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire, Value, #bc_state{w
             X ->
                 X
         end,
-
+%%io:format("WF: ~p~n", [WF]),
     ValSize =
         case Value of
             tombstone ->
@@ -1891,6 +1907,7 @@ do_put(Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire, Value, #bc_state{w
     #bc_state{write_file=WriteFile0} = State2,
 %%io:format("WriteFile0 : ~p~n", [WriteFile0]),
     [CorrectFile] = [W || W <- WriteFile0, W#filestate.split =:= Split],
+%%    io:format("Newstate: ~p~n", [State2]),
 %%  io:format("CorrectFile : ~p~n", [CorrectFile]),
 %%    io:format("Lock files: ~p~n", [State2#bc_state.write_lock]),
 %%    io:format("Wanted Lock file: ~p~n", [bitcask_lockops:read_activefile(write, State#bc_state.dirname, Split)]),
@@ -1970,6 +1987,7 @@ do_put(Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire, Value, #bc_state{w
 
 write_and_keydir_put(State2, Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire,
     Value, Tstamp, Retries, NowTstamp, OldFileId, OldOffset, Split) ->
+%%    io:format("write and keydir put is being hit"),
 %%  io:format("State write_file : ~p~n", [State2#bc_state.write_file]),
 %%  io:format("Split name : ~p~n", [Split]),
   [WriteFile] = [W || W <- State2#bc_state.write_file, W#filestate.split =:= Split],
@@ -1994,8 +2012,8 @@ write_and_keydir_put(State2, Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpi
                     %% does not see it.
                     %% Limit the number of recursions in case there is
                     %% a different issue with the keydir.
-                    {ok, WriteFile3} = bitcask_fileops:un_write(WriteFile2),
-                    State3 = wrap_write_file(WriteFile3, State2), %% TODO Check if this is the right operation we want to perform
+                    {ok, _WriteFile3} = bitcask_fileops:un_write(WriteFile2),
+                    State3 = wrap_write_file(WriteFile, State2), %% TODO Check if this is the right operation we want to perform
                     do_put(Key, DiskKey, DiskKeyOverwriteTombstone, TstampExpire, Value, State3, Retries - 1,
                         already_exists, Split)
             end;
@@ -2171,7 +2189,21 @@ default_decode_disk_key_fun(Key) ->
     #keyinfo{key = Key}.
 
 
+get_encode_riak_key_fun(Fun) when is_function(Fun) ->
+    Fun;
+get_encode_riak_key_fun(_) ->
+    fun default_encode_riak_key_fun/1.
 
+default_encode_riak_key_fun(Key) ->
+    term_to_binary(Key).
+
+get_decode_riak_key_fun(Fun) when is_function(Fun) ->
+    Fun;
+get_decode_riak_key_fun(_) ->
+    fun default_decode_riak_key_fun/1.
+
+default_decode_riak_key_fun(Key) ->
+    binary_to_term(Key).
 
 is_key_expired(?DEFAULT_TSTAMP_EXPIRE) -> false;
 is_key_expired(ExpireTstamp) ->
@@ -2181,7 +2213,6 @@ is_key_expired(ExpireTstamp) ->
 is_key_expired(?DEFAULT_TSTAMP_EXPIRE, _Now) -> false;
 is_key_expired(ExpireTstamp, Now) when ExpireTstamp < Now -> true;
 is_key_expired(_ExpireTstamp, _Now) -> false.
-
 
 make_bitcask_key(0, Bucket, Key) ->
   term_to_binary({Bucket, Key});
@@ -2203,11 +2234,11 @@ make_bitcask_key(3, {Type, Bucket, Split}, Key) ->
   TypeSz = size(Type),
   BucketSz = size(Bucket),
   SplitSz = size(Split),
-  <<?VERSION_2:7, 1:1, SplitSz:16/integer, Split/binary, TypeSz:16/integer, Type/binary, BucketSz:16/integer, Bucket/binary, Key/binary>>;
+  <<?VERSION_3:7, 1:1, SplitSz:16/integer, Split/binary, TypeSz:16/integer, Type/binary, BucketSz:16/integer, Bucket/binary, Key/binary>>;
 make_bitcask_key(3, {Bucket, Split}, Key) ->
   SplitSz = size(Split),
   BucketSz = size(Bucket),
-  <<?VERSION_2:7, 0:1, SplitSz:16/integer, Split/binary, BucketSz:16/integer, Bucket/binary, Key/binary>>.
+  <<?VERSION_3:7, 0:1, SplitSz:16/integer, Split/binary, BucketSz:16/integer, Bucket/binary, Key/binary>>.
 
 make_riak_key(<<?VERSION_3:7, HasType:1, SplitSz:16/integer, Split:SplitSz/bytes, Sz:16/integer,
   TypeOrBucket:Sz/bytes, Rest/binary>>) ->
@@ -2243,7 +2274,9 @@ make_riak_key(<<?VERSION_1:7, HasType:1, Sz:16/integer,
       {{TypeOrBucket, Bucket}, Key}
   end;
 make_riak_key(<<?VERSION_0:8,_Rest/binary>> = BK) ->
-  binary_to_term(BK).
+  binary_to_term(BK);
+make_riak_key(BK) when is_binary(BK) ->
+    BK.
 
 
 
@@ -2288,8 +2321,8 @@ put_kvs(B, KVs) ->
     lists:foreach(fun
                   ({K, V}) ->
                       ok = bitcask:put(B, K, V);
-                  ({K, V, Split}) ->
-                      ok = bitcask:put(B, K, V, [{split, Split}])
+                  ({BK, K, V, Split}) ->
+                      ok = bitcask:put(B, {BK, K}, V, [{split, Split}])
                 end, KVs).
 
 default_dataset() ->
@@ -2330,7 +2363,7 @@ write_lock_perms_test2() ->
     os:cmd("rm -rf /tmp/bc.test.writelockperms"),
     B = bitcask:open("/tmp/bc.test.writelockperms", [read_write]),
     ok = bitcask:put(B, <<"k">>, <<"v">>),
-    {ok, Info} = file:read_file_info("/tmp/bc.test.writelockperms/bitcask.write.lock"),
+    {ok, Info} = file:read_file_info("/tmp/bc.test.writelockperms/bitcask.write.default.lock"),
     ?assertEqual(8#00600, Info#file_info.mode band 8#00600),
     ok = bitcask:close(B).
 
@@ -2394,7 +2427,7 @@ fold_test_() ->
 fold_test2() ->
     B = init_dataset("/tmp/bc.test.fold", default_dataset()),
 
-    File = (get_state(B))#bc_state.write_file,
+    [File] = (get_state(B))#bc_state.write_file,
     L = bitcask_fileops:fold(File, fun(K, V, _Ts, _Pos, Acc) ->
                                            [{K, V} | Acc]
                                    end, []),
@@ -4091,29 +4124,71 @@ expired_keys_merge_1_test() ->
     bitcask:close(Ref1).
 
 split_merge_test() ->
-  Dir = "/tmp/bc.merge.batch",
-  DataSet = [{integer_to_binary(N), <<"data">>, Split} || Split <- [default, first, second], N <- lists:seq(1,20)],
-  close(init_dataset(Dir, [{max_file_size, 1}], DataSet)),
+    Opts = [{encode_riak_key, ?ENCODE_BITCASK_KEY}, {decode_riak_key, ?DECODE_BITCASK_KEY}],
+    Dir = "/tmp/bc.merge.split",
+    DataSet =
+        [{make_bitcask_key(3, {<<"bucket">>, Split}, integer_to_binary(N)), <<"data">>}
+            || Split <- [<<"default">>, <<"first">>, <<"second">>], N <- lists:seq(1, 10)],
+    close(init_dataset(Dir, [{max_file_size, 1} | Opts], DataSet)),
 
-  timer:sleep(900),
-  %% Verify number of files in directory
-  Files = length(readable_files("/tmp/bc.test.merge")),
+    timer:sleep(900),
+    %% Verify number of files in directory
+    30 = length(readable_files("/tmp/bc.merge.split")),
 
-  B = bitcask:open(Dir, [{read_write, true}]),
+    B = bitcask:open(Dir, [{read_write, true}]),
 
-  ct:pal("##################################################################################Numebr of bitcask files: ~p~n", [Files]),
+    A = bitcask:needs_merge(B), %% TODO Should this be returning false? Seems to base the bool off in memory read_files sop after an open this will be empty and return a false?
 
-  A = bitcask:needs_merge(B),
-  ct:pal("###################################################################################Needs merging: ~p~n", [A]),
+    bitcask:merge(Dir),
 
-  bitcask:merge(Dir),
+    3 = length(readable_files("/tmp/bc.merge.split")),
 
-  Files2 = length(readable_files("/tmp/bc.test.merge")),
+    lists:foldl(fun({K, V}, _) ->
+        R = bitcask:get(B, K),
+        ?assertEqual({K, {ok, V}}, {K, R})
+                end, undefined, DataSet),
 
-  ct:pal("####################################################################################Numebr of bitcask files: ~p~n", [Files2]),
-    bitcask:close(B),
+    bitcask:close(B).
 
-  ok.
+bucket_split_merge_test() ->
+    Opts = [{encode_riak_key, ?ENCODE_BITCASK_KEY}, {decode_riak_key, ?DECODE_BITCASK_KEY}],
+    Dir = "/tmp/bc.merge.split",
+    V2Keys = [{make_bitcask_key(2, <<"bucketA">>, integer_to_binary(N)), <<"val1">>}
+        || N <- lists:seq(1, 10)],
+    V3Keys = [{make_bitcask_key(3, {<<"bucketB">>, Split}, integer_to_binary(N)), <<"val2">>}
+        || Split <- [<<"default">>, <<"first">>], N <- lists:seq(1, 5)],
+    V3Keys2 = [{make_bitcask_key(3, {<<"bucketA">>, Split}, integer_to_binary(N)), <<"val3">>}
+        || Split <- [<<"bucketA">>], N <- lists:seq(1, 5)],
+
+    DataSet = lists:flatten([V2Keys, V3Keys, V3Keys2]),
+    close(init_dataset(Dir, [{max_file_size, 1} | Opts], DataSet)),
+
+    25 = length(readable_files("/tmp/bc.merge.split")),
+
+    ok.
+
+split_fold_test() ->
+    os:cmd("rm -rf /tmp/bc.fold.split"),
+    Key = make_bitcask_key(3, {<<"b">>, <<"default">>}, <<"k">>),
+    Key2 = make_bitcask_key(3, {<<"b2">>, <<"second">>}, <<"k2">>),
+    Key3 = make_bitcask_key(3, {<<"b">>, <<"default">>}, <<"k">>),
+    Key4 = make_bitcask_key(3, {<<"b7">>, <<"default">>}, <<"k7">>),
+    B = bitcask:open("/tmp/bc.fold.split", [read_write]),
+    ok = bitcask:put(B, Key, <<"v">>, [{split, default}]),
+    {ok, <<"v">>} = bitcask:get(B, Key),
+    ok = bitcask:put(B, Key2, <<"v2">>, [{split, second}]),
+    ok = bitcask:put(B, Key3, <<"v3">>, [{split, default}]),
+    {ok, <<"v2">>} = bitcask:get(B, Key2),
+    {ok, <<"v3">>} = bitcask:get(B, Key3),
+    ok = bitcask:delete(B, Key, [{split, default}]),
+    ok = bitcask:put(B, Key4, <<"v7">>, [{split, default}]),
+    close(B),
+    B2 = bitcask:open("/tmp/bc.fold.split"),
+    [{Key2, <<"v2">>}, {Key4, <<"v7">>}]
+        = bitcask:fold(B2,fun(K,V,Acc) -> [{K,V}|Acc] end,[]),
+    close(B2).
+
+%% TODO Write tests for splits for every operation. Get, Put, ListKeys, Fold etc.
 
 
 %% -------------------------------------------------------------------------------------------------------------- %%
