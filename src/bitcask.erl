@@ -333,7 +333,6 @@ put(Ref, Key, Value) ->
     put(Ref, Key, Value, ?DEFAULT_ENCODE_DISK_KEY_OPTS).
 put(Ref, Key, Value, Opts0) ->
     #bc_state { write_file = WriteFile } = State = get_state(Ref),
-    io:format("Are we putting?"),
 
     %% merge opts and default opts together
     Opts = lists:ukeymerge(1, lists:sort(Opts0), lists:sort(?DEFAULT_ENCODE_DISK_KEY_OPTS)),
@@ -1484,7 +1483,7 @@ get_filestate(FileId, Dirname, ReadFiles, Mode) ->
 list_data_files(Dirname, WritingFile, MergingFile) ->
     Files1 = bitcask_fileops:data_file_tstamps(Dirname),
     [F || {_Tstamp, F} <- lists:sort(Files1),
-          F /= WritingFile, F /= MergingFile].
+          false =:= lists:member(F, WritingFile) orelse false =:= lists:member(F, MergingFile)].
 
 merge_files(#mstate { input_files = [] } = State) ->
     State;
@@ -1762,7 +1761,6 @@ inner_merge_write(KeyDirKey, DiskKey, V, Tstamp, TstampExpire, OldFileId, OldOff
                 %% they did, we need to undo our write here.
                 case UpgradeKey of
                     true ->
-                        ct:pal("Is it fetchable: ~p~n", [bitcask_nifs:keydir_get(State#mstate.live_keydir, KeyDirKey)]),
                         case bitcask_nifs:keydir_remove(State#mstate.live_keydir, KeyDirKey, Tstamp, OldFileId, OldOffset) of
                             ok ->
                                 case bitcask_nifs:keydir_put(State1#mstate.live_keydir, NewKeyDirKey,
@@ -1813,13 +1811,6 @@ inner_merge_write(KeyDirKey, DiskKey, V, Tstamp, TstampExpire, OldFileId, OldOff
                 end
         end,
     NewOutList = lists:delete(OutFile1, State1#mstate.out_file),
-%%    case Split of
-%%        bucketA ->
-%%            ct:pal("Writen to file, OutFile1: ~p, OutFile2: ~p~n", [OutFile1, Outfile2]);
-%%        _ ->
-%%            ok
-%%    end,
-%%    io:format("Final outfile: ~p being added to NewOutList: ~p~n", [Outfile2, NewOutList]),
     State1#mstate { out_file = [Outfile2| NewOutList] }.
 
 
@@ -1898,31 +1889,31 @@ out_of_date(State, Key, Tstamp, IsKeyExpired, FileId, {_,_,Offset,_} = Pos,
 
 -spec readable_files(string()) -> [string()].
 readable_files(Dirname) ->
-    readable_files(Dirname, default).
-readable_files(Dirname, Split) ->
-    {ReadableFiles, _SetuidFiles} = readable_and_setuid_files(Dirname, Split),
+    readable_files(Dirname, []).
+readable_files(Dirname, Splits) ->
+    {ReadableFiles, _SetuidFiles} = readable_and_setuid_files(Dirname, Splits),
     ReadableFiles.
 
 readable_and_setuid_files(Dirname) ->
-    readable_and_setuid_files(Dirname, default).
-readable_and_setuid_files(Dirname, Split) ->
+    readable_and_setuid_files(Dirname, []).
+readable_and_setuid_files(Dirname, Splits) ->
     %% Check the write and/or merge locks to see what files are currently
     %% being written to. Generate our list excepting those.
-    WritingFile = bitcask_lockops:read_activefile(write, Dirname, Split),
-    MergingFile = bitcask_lockops:read_activefile(merge, Dirname, Split),
+    WritingFile = [bitcask_lockops:read_activefile(write, Dirname, Split) || Split <- Splits],
+    MergingFile = [bitcask_lockops:read_activefile(merge, Dirname, Split) || Split <- Splits],
 
     %% Filter out files with setuid bit set: they've been marked for
     %% deletion by an earlier *successful* merge.
     Fs = [F || F <- list_data_files(Dirname, WritingFile, MergingFile)],
 
-    WritingFile2 = bitcask_lockops:read_activefile(write, Dirname, Split),
-    MergingFile2 = bitcask_lockops:read_activefile(merge, Dirname, Split),
+    WritingFile2 = [bitcask_lockops:read_activefile(write, Dirname, Split) || Split <- Splits],
+    MergingFile2 = [bitcask_lockops:read_activefile(merge, Dirname, Split) || Split <- Splits],
     case {WritingFile2, MergingFile2} of
         {WritingFile, MergingFile} ->
             lists:partition(fun(F) -> not has_pending_delete_bit(F) end, Fs);
         _ ->
             % Changed while fetching file list, retry
-            readable_and_setuid_files(Dirname, Split)
+            readable_and_setuid_files(Dirname, Splits)
     end.
 
 %% Internal put - have validated that the file is opened for write
@@ -2198,7 +2189,7 @@ purge_setuid_files(Dirname) ->
         {ok, WriteLock} ->
             try
                 StaleFs = [F || F <- list_data_files(Dirname,
-                                                     undefined, undefined),
+                                                     [], []),
                                 has_pending_delete_bit(F)],
                 _ = [bitcask_fileops:delete(#filestate{filename = F}) ||
                         F <- StaleFs],
@@ -2479,9 +2470,7 @@ init_dataset(Dirname, Opts, KVs) ->
 put_kvs(B, KVs) ->
     lists:foreach(fun
                   ({K, V}) ->
-                      ok = bitcask:put(B, K, V);
-                  ({BK, K, V, Split}) ->
-                      ok = bitcask:put(B, {BK, K}, V, [{split, Split}])
+                      ok = bitcask:put(B, K, V)
                 end, KVs).
 
 default_dataset() ->
@@ -2540,7 +2529,7 @@ list_data_files_test2() ->
     [] = os:cmd(?FMT("touch ~s", [string:join(ExpFiles, " ")])),
 
     %% Now use the list_data_files to scan the dir
-    ExpFiles = list_data_files("/tmp/bc.test.list", undefined, undefined).
+    ExpFiles = list_data_files("/tmp/bc.test.list", [], []).
 
 % Test that readable_files will not return the currently active
 % write or merge file by mistake if they change in between fetching them
@@ -4367,6 +4356,52 @@ split_fold_test() ->
     {ok, <<"v3">>} = bitcask:get(B, Key3),
     ok = bitcask:delete(B, Key1, [{split, default}]),
     ok = bitcask:put(B, Key4, <<"v7">>, [{split, default}]),
+    close(B),
+    B2 = bitcask:open("/tmp/bc.fold.split"),
+
+    [{Key2, <<"v2">>}, {Key4, <<"v7">>}]
+        = bitcask:fold(B2,fun(K,V,Acc) -> [{K,V}|Acc] end,[]),
+    close(B2).
+
+split_puts_test() ->
+    Dir = "/tmp/bc.put.split",
+    os:cmd("rm -rf /tmp/bc.put.split"),
+    Key1 = make_bitcask_key(3, {<<"b">>, <<"default">>}, <<"k">>),
+    Key2 = make_bitcask_key(3, {<<"b2">>, <<"second">>}, <<"k2">>),
+    Key3 = make_bitcask_key(3, {<<"b3">>, <<"default">>}, <<"k3">>),
+    Key4 = make_bitcask_key(3, {<<"b7">>, <<"default">>}, <<"k7">>),
+    Key5 = make_bitcask_key(3, {<<"b7">>, <<"second">>}, <<"k8">>),
+    Opts = [{read_write, true}, {find_split_fun, ?FIND_SPLIT_FUN}, {encode_riak_key, ?ENCODE_BITCASK_KEY}, {decode_riak_key, ?DECODE_BITCASK_KEY}],
+    B = bitcask:open(Dir, Opts),
+
+    ok = bitcask:put(B, Key1, <<"v">>),
+    {ok, <<"v">>} = bitcask:get(B, Key1),
+    ok = bitcask:put(B, Key2, <<"v2">>),
+    {ok, <<"v2">>} = bitcask:get(B, Key2),
+
+    Files1 = bitcask_fileops:data_file_tstamps(Dir),
+    Files2 = [F || {_Tstamp, F} <- lists:sort(Files1)],
+    2 = length(Files2),
+
+    ct:pal("Readable files3: ~p~n", [Files2]),
+    ct:pal("Attemoting a get of key3: ~p~n", [bitcask:get(B, Key3)]),
+    ok = bitcask:put(B, Key3, <<"something">>),
+    {ok, <<"something">>} = bitcask:get(B, Key3),
+
+    Files3 = bitcask_fileops:data_file_tstamps(Dir),
+    Files4 = [F || {_Tstamp, F} <- lists:sort(Files3)],
+    ct:pal("Readable files4: ~p~n", [Files4]),
+    2 = length(Files4),                                 %% TODO BUG: this test will fail due to keydir_put nif failing because we're putting to an older file id than the most current one.
+
+    ok = bitcask:put(B, Key5, <<"v5">>),
+    {ok, <<"v5">>} = bitcask:get(B, Key5),
+
+    Files5 = bitcask_fileops:data_file_tstamps(Dir),
+    Files6 = [F || {_Tstamp, F} <- lists:sort(Files5)],
+    2 = length(Files6),
+
+    ok = bitcask:delete(B, Key1),
+    ok = bitcask:put(B, Key4, <<"v7">>),
     close(B),
     B2 = bitcask:open("/tmp/bc.fold.split"),
 
