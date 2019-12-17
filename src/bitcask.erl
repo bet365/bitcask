@@ -1889,13 +1889,13 @@ out_of_date(State, Key, Tstamp, IsKeyExpired, FileId, {_,_,Offset,_} = Pos,
 
 -spec readable_files(string()) -> [string()].
 readable_files(Dirname) ->
-    readable_files(Dirname, []).
+    readable_files(Dirname, [default]).
 readable_files(Dirname, Splits) ->
     {ReadableFiles, _SetuidFiles} = readable_and_setuid_files(Dirname, Splits),
     ReadableFiles.
 
 readable_and_setuid_files(Dirname) ->
-    readable_and_setuid_files(Dirname, []).
+    readable_and_setuid_files(Dirname, [default]).
 readable_and_setuid_files(Dirname, Splits) ->
     %% Check the write and/or merge locks to see what files are currently
     %% being written to. Generate our list excepting those.
