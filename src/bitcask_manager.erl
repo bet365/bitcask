@@ -24,6 +24,8 @@
 	check_and_upgrade_key/2
 ]).
 
+-include("bitcask.hrl").
+
 -define(VERSION_0, 0).
 -define(VERSION_1, 1).
 -define(VERSION_2, 2).
@@ -48,12 +50,30 @@
 	end ).
 -define(CHECK_AND_UPGRADE_KEY, fun check_and_upgrade_key/2).
 
+-record(bc_state, {dirname :: string(),
+	write_file :: [#filestate{}],     % File for writing, [write_file]
+	write_lock :: [{atom(), reference()}],     % Reference to write lock
+	read_files :: [#filestate{}],     % Files opened for reading
+	max_file_size :: integer(),  % Max. size of a written file
+	opts :: list(),           % Original options used to open the bitcask
+	encode_disk_key_fun :: function(),
+	decode_disk_key_fun :: function(),
+	encode_riak_key_fun :: function(),
+	decode_riak_key_fun :: function(),
+	find_split_fun      :: function(),
+	keydir :: reference(),       % Key directory
+	read_write_p :: integer(),    % integer() avoids atom -> NIF
+	% What tombstone style to write, for testing purposes only.
+	% 0 = old style without file id, 2 = new style with file id
+	tombstone_version = 2 :: 0 | 2
+}).
+
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 -endif.
 
 -record(state, {
-	open_instances 	:: [{atom(), reference()}],
+	open_instances 	:: [{atom(), reference(), boolean()}],
 	open_dirs		:: [{atom(), string()}]
 }).
 
@@ -108,13 +128,36 @@ get(Ref, Key1, Opts) ->
 %%	Split = ?FIND_SPLIT_FUN(Key1),
 	Split = proplists:get_value(split, Opts),
 
-	case proplists:get_value(Split, OpenInstances) of
-		undefined ->
-			BitcaskRef = proplists:get_value(default, OpenInstances),
-			bitcask:get(BitcaskRef, Key1);
-		BitcaskRef ->
-			bitcask:get(BitcaskRef, Key1)
+	DefRef = proplists:get_value(default, OpenInstances),
+	DefState = erlang:get(DefRef),
+	SplitRef = proplists:get_value(Split, OpenInstances),
+
+	%% TODO Pass the return entry to bitcask:get then it can handle the responses. bitcask:get(Ref, Key, Entry)
+
+	case bitcask_nifs:keydir_get(DefState#bc_state.keydir, Key1) of
+		not_found ->
+			SplitState = erlang:get(SplitRef),
+			case bitcask_nifs:keydir_get(SplitState#bc_state.keydir, Key1) of
+				not_found ->
+					not_found;
+				Entry ->
+					Entry
+			end;
+		Entry ->
+			Entry
 	end.
+
+%%	case proplists:get_value(Split, OpenInstances) of
+%%		undefined ->
+%%			BitcaskRef = proplists:get_value(default, OpenInstances),
+%%			bitcask:get(BitcaskRef, Key1);
+%%		BitcaskRef ->
+%%			BState = erlang:get(BitcaskRef),
+%%			case bitcask_nifs:keydir_get(BState, Key1) of
+%%
+%%			end,
+%%			bitcask:get(BitcaskRef, Key1)
+%%	end.
 
 put(Ref, Key, Value) ->
 	put(Ref, Key, Value, []).
@@ -158,27 +201,56 @@ merge(Ref, _Dirname, Opts, FilesToMerge) ->
 		undefined ->
 			[bitcask:merge(Dir, Opts, FilesToMerge) || {_Split, Dir} <- OpenDirs];
 		true ->
-			MergeFun = fun(Split, Key, Value) -> special_merge_fun(Split, Key, Value, Ref) end,
+			ct:pal("Triggering special mergecall"),
+			MergeFun = fun(Split, Key, KeyDirKey, Value, Tstamp, TstampExpire) -> special_merge_fun(Split, Key, KeyDirKey, Value, Tstamp, TstampExpire, Ref) end,
 			NewOpts = [{special_merge_fun, MergeFun} | Opts],
 			[bitcask:merge(Dir, [{current_split, Split} | NewOpts], FilesToMerge) || {Split, Dir} <- OpenDirs],
 			ok
 	end.
 
-special_merge_fun(CurrentSplit, Key1, Value, Ref) ->
+special_merge_fun(CurrentSplit, Key1, KeyDirKey, Value, Tstamp, TstampExpire, Ref) ->
 	State = erlang:get(Ref),
 	OpenInstances = State#state.open_instances,
 	NewSplit = ?FIND_SPLIT_FUN(Key1),
+	ct:pal("Special merge, New SPlit: ~p CurrentSPlit: ~p Value: ~p~n", [NewSplit, CurrentSplit, Value]),
+
 	case NewSplit of
 		CurrentSplit ->
-			ok;
+			false;
 		_ ->
 			case proplists:get_value(NewSplit, OpenInstances) of
 				undefined ->
 					ok;
 				BitcaskRef ->
-					bitcask:put(BitcaskRef, Key1, Value)
+					BCState = erlang:get(BitcaskRef),
+					KeyDir = BCState#bc_state.keydir,
+					WriteFiles = BCState#bc_state.write_file,
+					[WriteFile] = [W || W <- WriteFiles, W#filestate.split =:= NewSplit],
+					%% TODO Now we have the file we should add all checks for size of the entry against the file and wrap if necessary
+
+					{ok, WriteFile2, Offset, Size} =
+						bitcask_fileops:write(WriteFile, Key1, Value, Tstamp),
+
+					OutFileId = bitcask_fileops:file_tstamp(WriteFile2),
+
+					case bitcask_nifs:keydir_put(KeyDir, KeyDirKey,
+						OutFileId,
+						Size, Offset, Tstamp, TstampExpire,
+						bitcask_time:tstamp(),
+						0, 0) of
+						ok ->
+							WriteFile2;
+						already_exists ->
+							{ok, O} = bitcask_fileops:un_write(WriteFile2),
+							O
+					end
+
 			end
 	end.
+
+
+
+
 
 %%%===================================================================
 %%% Internal functions
@@ -279,7 +351,8 @@ manager_merge_test() ->
 	Key4 = make_bitcask_key(3, {<<"b4">>, <<"second">>}, <<"k4">>),
 	Key5 = make_bitcask_key(3, {<<"b5">>, <<"second">>}, <<"k5">>),
 	Key6 = make_bitcask_key(3, {<<"b6">>, <<"second">>}, <<"k6">>),
-	_Keys = [Key1, Key2, Key3, Key4, Key5, Key6],
+	Key7 = make_bitcask_key(3, {<<"b7">>, <<"second">>}, <<"k7">>),
+	_Keys = [Key1, Key2, Key3, Key4, Key5, Key6, Key7],
 	B = bitcask_manager:open(Dir, [{read_write, true}, {split, default}, {max_file_size, 1}]),
 	bitcask_manager:open(B, Dir, [{read_write, true}, {split, second}, {max_file_size, 1}]),
 
@@ -297,23 +370,47 @@ manager_merge_test() ->
 	{ok, <<"Value5">>} = bitcask_manager:get(B, Key5, [{split, second}]),
 	{ok, <<"Value6">>} = bitcask_manager:get(B, Key6, [{split, second}]),
 
+	%% Put key to split it doesnt belong in and check if merge picks it up
+	bitcask_manager:put(B, Key7, <<"Value7">>, [{split, default}]),
+	{ok, <<"Value7">>} = bitcask_manager:get(B, Key7, [{split, default}]),
+
 %%	NewKeys = bitcask_manager:list_keys(B, [{split, all}]),
 %%
 %%	ct:pal("Keys: ~p~n", [Keys]),
 %%	ct:pal("Fetched Keys: ~p~n", [NewKeys]),
 %%
 %%	?assertEqual(NewKeys, Keys),
+	DefDir = lists:concat([Dir, "/", default]),
+	ct:pal("DefDir: ~p~n", [DefDir]),
+	Files3 = bitcask_fileops:data_file_tstamps(DefDir),
+	ct:pal("Files in the default dir location: ~p~n", [Files3]),
 
 
 	FileFun =
 		fun(N, Split) ->
 			lists:concat([Dir, "/", Split, "/", N, ".", "bitcask.data"])
 		end,
-	MergeFiles = [FileFun(X, default) || X <- lists:seq(1,3)],
+	MergeFiles = [FileFun(X, default) || X <- lists:seq(1,4)],
 	MergeFiles2 = [FileFun(X, second) || X <- lists:seq(1,3)],
 
+%%	MergeFiles3 = lists:flatten(MergeFiles, MergeFiles2),
+	MergeFiles3 = lists:foldl(fun(X, A) -> [X | A] end, MergeFiles, MergeFiles2),
 	ct:pal("MergeFiles1: ~p~n", [MergeFiles]),
 	ct:pal("MergeFiles2: ~p~n", [MergeFiles2]),
+	ct:pal("MergeFiles3: ~p~n", [MergeFiles3]),
+
+	bitcask_manager:close(B),
+
+	C = bitcask_manager:open(Dir, [{read_write, true}, {split, default}]),
+	bitcask_manager:open(C, Dir, [{read_write, true}, {split, second}]),
+
+	ct:pal("Reopened the instances: ~p~n", [erlang:get(C)]),
+	Opts = [{find_split_fun, ?FIND_SPLIT_FUN}, {special_merge, true}],
+
+	bitcask_manager:merge(C, Dir, Opts, MergeFiles3), %% TODO Find right options to send through
+
+	{ok, <<"Value7">>} = bitcask_manager:get(C, Key7, [{split, default}]),
+	{ok, <<"Value7">>} = bitcask_manager:get(C, Key7, [{split, second}]),
 
 	ok.
 

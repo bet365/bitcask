@@ -142,6 +142,8 @@
                   find_split_fun :: function(),
                   check_and_upgrade_key_fun :: function(),
                   upgrade_key :: boolean(),
+                  special_merge_fun :: function(),
+                  current_split :: atom(),
                   read_write_p :: integer(),    % integer() avoids atom -> NIF
                   opts :: list(),
                   delete_files :: [#filestate{}]}).
@@ -683,6 +685,8 @@ merge1(Dirname, Opts, FilesToMerge0, ExpiredFiles) ->
     FindSplitFun = get_find_split_fun(get_opt(find_split_fun, Opts)),
     CheckUpgradeFun = get_check_and_upgrade_key_fun(get_opt(check_and_upgrade_key_fun, Opts)),
     UpgradeKey = get_opt(upgrade_key, Opts),
+    SpecialMergeFun = get_special_merge_fun(get_opt(special_merge_fun, Opts)),
+    CurrentSplit = get_opt(current_split, Opts),
 
     %% Try to lock for merging  %% TODO We need to acquire all locks in dir rather than just the one.
     case bitcask_lockops:acquire(merge, Dirname) of
@@ -786,6 +790,8 @@ merge1(Dirname, Opts, FilesToMerge0, ExpiredFiles) ->
                       expiry_grace_time = expiry_grace_time(Opts),
                       decode_disk_key_fun = DecodeDiskKeyFun,
                       find_split_fun = FindSplitFun,
+                      special_merge_fun = SpecialMergeFun,
+                      current_split = CurrentSplit,
                       check_and_upgrade_key_fun = CheckUpgradeFun,
                       upgrade_key = UpgradeKey,
                       read_write_p = 0,
@@ -1668,6 +1674,8 @@ check_and_upgrade_key(_Split, KeyDirKey) ->
 inner_merge_write(KeyDirKey, DiskKey, V, Tstamp, TstampExpire, OldFileId, OldOffset, State) ->
     %% write a single item while inside the merge process
     FindSplitFun = State#mstate.find_split_fun,
+    SpecialMergeFun = State#mstate.special_merge_fun,
+    CurrentSplit = State#mstate.current_split,
     UpgradeKey = State#mstate.upgrade_key,
     CheckUpgradeKeyFun = State#mstate.check_and_upgrade_key_fun,
 
@@ -1734,84 +1742,83 @@ inner_merge_write(KeyDirKey, DiskKey, V, Tstamp, TstampExpire, OldFileId, OldOff
 
     [OutFile1] = [O || O <- State1#mstate.out_file, O#filestate.split =:= Split],
 
-    {ok, OutFile2, Offset, Size} =
-        bitcask_fileops:write(OutFile1, NewDiskKey, V, Tstamp),
-
-%%    case Split of
-%%        bucketA ->
-%%
-%%            ct:pal("Writing to Outfile1, OutFile2, Offset and Size: ~p, ~p, ~p ~p~n", [OutFile1, OutFile2, Offset, Size]);
-%%        _ ->
-%%            ok
-%%    end,
-    OutFileId = bitcask_fileops:file_tstamp(OutFile2),
-    case OutFileId =< OldFileId of
-        true ->
-            exit({invariant_violation, DiskKey, V, OldFileId, OldOffset, "->",
-                  OutFileId, Offset});
+    case SpecialMergeFun(CurrentSplit, NewDiskKey, KeyDirKey, V, Tstamp, TstampExpire) of
         false ->
-            ok
-    end,
-    Outfile2 =
-        case is_tombstone(V) of
-            false ->
-                %% Update live keydir for the current out
-                %% file. It's possible that someone else may have written
-                %% a newer value whilst we were processing ... and if
-                %% they did, we need to undo our write here.
-                case UpgradeKey of
-                    true ->
-                        case bitcask_nifs:keydir_remove(State#mstate.live_keydir, KeyDirKey, Tstamp, OldFileId, OldOffset) of
-                            ok ->
-                                case bitcask_nifs:keydir_put(State1#mstate.live_keydir, NewKeyDirKey,
+            {ok, OutFile2, Offset, Size} =
+                bitcask_fileops:write(OutFile1, NewDiskKey, V, Tstamp),
+
+            OutFileId = bitcask_fileops:file_tstamp(OutFile2),
+            case OutFileId =< OldFileId of
+                true ->
+                    exit({invariant_violation, DiskKey, V, OldFileId, OldOffset, "->",
+                        OutFileId, Offset});
+                false ->
+                    ok
+            end,
+            Outfile2 =
+                case is_tombstone(V) of
+                    false ->
+                        %% Update live keydir for the current out
+                        %% file. It's possible that someone else may have written
+                        %% a newer value whilst we were processing ... and if
+                        %% they did, we need to undo our write here.
+                        case UpgradeKey of
+                            true ->
+                                case bitcask_nifs:keydir_remove(State#mstate.live_keydir, KeyDirKey, Tstamp, OldFileId, OldOffset) of
+                                    ok ->
+                                        case bitcask_nifs:keydir_put(State1#mstate.live_keydir, NewKeyDirKey,
+                                            OutFileId,
+                                            Size, Offset, Tstamp, TstampExpire,
+                                            bitcask_time:tstamp(),
+                                            0, 0) of
+                                            ok ->
+                                                OutFile2;
+                                            already_exists ->
+                                                {ok, O} = bitcask_fileops:un_write(OutFile2),
+                                                O
+                                        end;
+                                    already_exists ->
+                                        {ok, O} = bitcask_fileops:un_write(OutFile2),
+                                        O
+
+                                end;
+                            _ ->
+                                case bitcask_nifs:keydir_put(State1#mstate.live_keydir, KeyDirKey,
                                     OutFileId,
                                     Size, Offset, Tstamp, TstampExpire,
                                     bitcask_time:tstamp(),
-                                    0, 0) of
+                                    OldFileId, OldOffset) of
                                     ok ->
                                         OutFile2;
                                     already_exists ->
                                         {ok, O} = bitcask_fileops:un_write(OutFile2),
                                         O
-                                end;
-                            already_exists ->
-                                {ok, O} = bitcask_fileops:un_write(OutFile2),
-                                O
-
+                                end
                         end;
-                    _ ->
-                        case bitcask_nifs:keydir_put(State1#mstate.live_keydir, KeyDirKey,
-                            OutFileId,
-                            Size, Offset, Tstamp, TstampExpire,
-                            bitcask_time:tstamp(),
-                            OldFileId, OldOffset) of
-                            ok ->
+                    true ->
+                        case bitcask_nifs:keydir_get(State1#mstate.live_keydir, KeyDirKey) of   %% TODO Which Key do we want to use here?
+                            not_found ->
+                                % Update timestamp and total bytes stats
+                                ok = bitcask_nifs:update_fstats(
+                                    State1#mstate.live_keydir,
+                                    OutFileId,
+                                    Tstamp, 0,
+                                    0, 0, 0, Size,
+                                    _ShouldCreate = 1),
+                                % Still not there, tombstone write is cool
                                 OutFile2;
-                            already_exists ->
+                            #bitcask_entry{} ->
+                                % New value written, undo
                                 {ok, O} = bitcask_fileops:un_write(OutFile2),
                                 O
                         end
-                end;
-           true ->
-                case bitcask_nifs:keydir_get(State1#mstate.live_keydir, KeyDirKey) of   %% TODO Which Key do we want to use here?
-                    not_found ->
-                        % Update timestamp and total bytes stats
-                        ok = bitcask_nifs:update_fstats(
-                               State1#mstate.live_keydir,
-                               OutFileId,
-                               Tstamp, 0,
-                               0, 0, 0, Size,
-                               _ShouldCreate = 1),
-                        % Still not there, tombstone write is cool
-                        OutFile2;
-                    #bitcask_entry{} ->
-                        % New value written, undo
-                        {ok, O} = bitcask_fileops:un_write(OutFile2),
-                        O
-                end
-        end,
-    NewOutList = lists:delete(OutFile1, State1#mstate.out_file),
-    State1#mstate { out_file = [Outfile2| NewOutList] }.
+                end,
+            NewOutList = lists:delete(OutFile1, State1#mstate.out_file),
+            State1#mstate{out_file = [Outfile2 | NewOutList]};
+        Outfile2 ->
+            NewOutList = lists:delete(OutFile1, State1#mstate.out_file),
+            State1#mstate{out_file = [Outfile2 | NewOutList]}
+    end.
 
 
 out_of_date(_State, _Key, _Tstamp, _IsKeyExpired, _FileId, _Pos, _ExpiryTime,
@@ -2314,6 +2321,14 @@ get_check_and_upgrade_key_fun(_) ->
 
 default_check_and_upgrade_key_fun(_, Key) ->
     Key.
+
+get_special_merge_fun(Fun) when is_function(Fun) ->
+    Fun;
+get_special_merge_fun(_) ->
+    fun default_special_merge_fun/4.
+
+default_special_merge_fun(_, _, _, _) ->
+    false.
 
 is_key_expired(?DEFAULT_TSTAMP_EXPIRE) -> false;
 is_key_expired(ExpireTstamp) ->
