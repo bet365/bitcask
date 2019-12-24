@@ -43,7 +43,9 @@
 
 -export([get_opt/2,
          get_filestate/2,
-         is_tombstone/1]).
+         is_tombstone/1,
+         wrap_write_file/1,
+         check_get/5]).
 -export([has_pending_delete_bit/1]).                    % For EUnit tests
 
 -include_lib("kernel/include/file.hrl").
@@ -287,6 +289,50 @@ get(Ref, Key, TryNum) ->
                                 {error, _} = Err ->
                                     Err
                             end
+                    end
+            end
+    end.
+
+check_get(Key, E, Ref, State, TryNum) when is_record(E, bitcask_entry) ->
+    case E#bitcask_entry.tstamp < expiry_time(State#bc_state.opts) orelse
+        is_key_expired(E#bitcask_entry.tstamp_expire) of
+        true ->
+            %% Expired entry; remove from keydir
+            case bitcask_nifs:keydir_remove(State#bc_state.keydir, Key,
+                E#bitcask_entry.tstamp,
+                E#bitcask_entry.file_id,
+                E#bitcask_entry.offset) of
+                ok ->
+                    not_found;
+                already_exists ->
+                    % Updated since last read, try again.
+                    get(Ref, Key, TryNum-1)
+            end;
+        false ->
+            %% HACK: Use a fully-qualified call to get_filestate/2 so that
+            %% we can intercept calls w/ Pulse tests.
+            case ?MODULE:get_filestate(E#bitcask_entry.file_id, State) of
+                {error, enoent} ->
+                    %% merging deleted file between keydir_get and here
+                    get(Ref, Key, TryNum-1);
+                {error, _} = Else ->
+                    Else;
+                {Filestate, S2} ->
+                    put_state(Ref, S2),
+                    case bitcask_fileops:read(Filestate,
+                        E#bitcask_entry.offset,
+                        E#bitcask_entry.total_sz) of
+                        {ok, _Key, Value} ->
+                            case is_tombstone(Value) of
+                                true ->
+                                    not_found;
+                                false ->
+                                    {ok, Value}
+                            end;
+                        {error, eof} ->
+                            not_found;
+                        {error, _} = Err ->
+                            Err
                     end
             end
     end.
