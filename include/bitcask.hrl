@@ -40,6 +40,21 @@
                       oldest_tstamp_expire :: integer() }).
 
 
+-record(bc_state, {dirname :: string(),
+    write_file :: 'fresh' | 'undefined' | #filestate{},     % File for writing
+    write_lock :: reference(),     % Reference to write lock
+    read_files :: [#filestate{}],     % Files opened for reading
+    max_file_size :: integer(),  % Max. size of a written file
+    opts :: list(),           % Original options used to open the bitcask
+    encode_disk_key_fun :: function(),
+    decode_disk_key_fun :: function(),
+    keydir :: reference(),       % Key directory
+    read_write_p :: integer(),    % integer() avoids atom -> NIF
+    % What tombstone style to write, for testing purposes only.
+    % 0 = old style without file id, 2 = new style with file id
+    tombstone_version = 2 :: 0 | 2
+}).
+
 -define(FMT(Str, Args), lists:flatten(io_lib:format(Str, Args))).
 
 -define(TOMBSTONE_PREFIX, "bitcask_tombstone").
