@@ -24,7 +24,7 @@
 	list_keys/2,
 	fold_keys/4,
 	fold_keys/7,
-	merge/4,
+	merge/2,
 	special_merge/4,
 	make_bitcask_key/3,
 	check_and_upgrade_key/2
@@ -272,7 +272,7 @@ delete(Ref, Key, Opts) ->
 				_ ->
 					error_could_not_delete_data_still_exists_in_default_split %% Here we could just delete from both?
 			end
-	end
+	end.
 
 list_keys(Ref, Opts) ->
 	Split = proplists:get_value(split, Opts, default),
@@ -313,12 +313,15 @@ fold_keys(Ref, Fun, Acc, Opts, MaxAge, MaxPuts, SeeTombStoneP) ->
 	end.
 
 %% TODO This is unfinished, need to check for `active` splits to merge.
-merge(Ref, _Dirname, Opts, FilesToMerge) ->
+merge(Ref, Opts) ->
 	State = erlang:get(Ref),
 	_OpenInstances = State#state.open_instances,
 	OpenDirs = State#state.open_dirs,
 
-	[bitcask:merge(Dir, Opts, FilesToMerge) || {_Split, Dir} <- OpenDirs].
+	[begin
+		 FilesToMerge = bitcask:readable_files(Dir),
+		 bitcask:merge(Dir, Opts, FilesToMerge)
+	 end || {_Split, Dir} <- OpenDirs].
 
 special_merge(Ref, Split1, Split2, Opts) ->
 	State = erlang:get(Ref),
@@ -679,7 +682,7 @@ manager_merge_test() ->
 	Key4 = make_bitcask_key(3, {<<"b4">>, <<"second">>}, <<"k4">>),
 	Key5 = make_bitcask_key(3, {<<"b5">>, <<"second">>}, <<"k5">>),
 	Key6 = make_bitcask_key(3, {<<"b6">>, <<"second">>}, <<"k6">>),
-	_Keys = [Key1, Key2, Key3, Key4, Key5, Key6],
+%%	_Keys = [Key1, Key2, Key3, Key4, Key5, Key6],
 	B = bitcask_manager:open(Dir, [{read_write, true}, {split, default}, {max_file_size, 1}]),
 	bitcask_manager:open(B, Dir, [{read_write, true}, {split, second}, {max_file_size, 1}]),
 
@@ -784,8 +787,47 @@ manager_merge_test() ->
 
 	Files4 = bitcask_fileops:data_file_tstamps(DefDir),
 	Files5 = bitcask_fileops:data_file_tstamps(DefDir2),
+	MergeFiles4 = [{X, FileFun(X, default)} || X <- lists:seq(1,8)],
+	MergeFiles5 = [{X, FileFun(X, second)}  || X <- lists:seq(1,4)],
 	ct:pal("Files in the default dir location final: ~p~n", [Files4]),
 	ct:pal("Files in the second dir location final: ~p~n", [Files5]),
+	?assertEqual(Files4, MergeFiles4),
+	?assertEqual(Files5, MergeFiles5),
+
+	ct:pal("Checking needs merge of defref: ~p~n", [bitcask:readable_files(DefDir)]),
+	ct:pal("Checking needs merge of splitref: ~p~n", [bitcask:readable_files(DefDir2)]),
+
+	bitcask_manager:merge(B, []),
+
+	bitcask_manager:put(B, Key8, <<"Value9">>, [{split, second}]),
+
+	ct:pal("Checking needs merge of defref2: ~p~n", [bitcask:readable_files(DefDir)]),
+	ct:pal("Checking needs merge of splitref2: ~p~n", [bitcask:readable_files(DefDir2)]),
+
+	Files6 = bitcask_fileops:data_file_tstamps(DefDir),
+	Files7 = bitcask_fileops:data_file_tstamps(DefDir2),
+	ct:pal("Files in the default dir location final: ~p~n", [Files6]),
+	ct:pal("Files in the second dir location final: ~p~n", [Files7]),
+
+	{ok, <<"Value4">>} = bitcask_manager:get(B, Key4, [{split, second}]),
+	{ok, <<"Value5">>} = bitcask_manager:get(B, Key5, [{split, second}]),
+	{ok, <<"Value6">>} = bitcask_manager:get(B, Key6, [{split, second}]),
+	{ok, <<"Value8">>} = bitcask_manager:get(B, Key8, [{split, second}]),
+
+	{ok, <<"Value1">>} = bitcask_manager:get(B, Key1, [{split, default}]),
+	{ok, <<"Value2">>} = bitcask_manager:get(B, Key2, [{split, default}]),
+	{ok, <<"Value3">>} = bitcask_manager:get(B, Key3, [{split, default}]),
+	{ok, <<"Value7">>} = bitcask_manager:get(B, Key7, [{split, default}]),
+
+	#bitcask_entry{} = bitcask_nifs:keydir_get(DefState#bc_state.keydir, Key1),
+	#bitcask_entry{} = bitcask_nifs:keydir_get(DefState#bc_state.keydir, Key2),
+	#bitcask_entry{} = bitcask_nifs:keydir_get(DefState#bc_state.keydir, Key3),
+	#bitcask_entry{} = bitcask_nifs:keydir_get(DefState#bc_state.keydir, Key7),
+
+	#bitcask_entry{} = bitcask_nifs:keydir_get(SplitState#bc_state.keydir, Key4),
+	#bitcask_entry{} = bitcask_nifs:keydir_get(SplitState#bc_state.keydir, Key5),
+	#bitcask_entry{} = bitcask_nifs:keydir_get(SplitState#bc_state.keydir, Key6),
+	#bitcask_entry{} = bitcask_nifs:keydir_get(SplitState#bc_state.keydir, Key8),
 
 	{ok, something} = bitcask_manager:get(B, Key4, [{split, default}]), %% This is here to cause failure to check logs
 
