@@ -116,7 +116,7 @@ update_fstats(put, K, {ok, OldV}, NewV, #m_fstats{live_bytes = LB,
 
 check_fstats(Ref, Expect) ->
     Aggregate = fun({_FileId, FileLiveCount, FileTotalCount, FileLiveBytes, FileTotalBytes,
-                     _FileOldestTstamp, _FileNewestTstamp, _ExpEpoch},
+                     _FileOldestTstamp, _FileNewestTstamp, _ExpEpoch, _OldestTstampExpire},
                     {LiveCount0, TotalCount0, LiveBytes0, TotalBytes0}) ->
                         {LiveCount0 + FileLiveCount, TotalCount0 + FileTotalCount, 
                          LiveBytes0 + FileLiveBytes, TotalBytes0 + FileTotalBytes}
@@ -349,7 +349,7 @@ fold2_test2() ->
                          {put,<<1>>,<<>>}],1}])).
 
 get_keydir(Ref) ->
-    element(9, erlang:get(Ref)).    
+    element(10, erlang:get(Ref)).
 
 -endif.
 

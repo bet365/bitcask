@@ -144,6 +144,7 @@ typedef struct
     uint64_t offset;
     uint64_t epoch;
     uint32_t tstamp;
+    uint32_t tstamp_expire;
     uint16_t key_sz;
     char     key[0];
 } bitcask_keydir_entry;
@@ -163,6 +164,7 @@ typedef struct
     uint64_t total_bytes; // total number of bytes written to file
     uint32_t oldest_tstamp; // oldest observed tstamp in a file
     uint32_t newest_tstamp; // newest observed tstamp in a file
+    uint32_t oldest_tstamp_expire; // oldest tstamp expire in file
     uint64_t expiration_epoch; // file obsolete at this epoch
 } bitcask_fstats_entry;
 
@@ -173,6 +175,7 @@ struct bitcask_keydir_entry_sib
     uint64_t offset;
     uint64_t epoch;
     uint32_t tstamp;
+    uint32_t tstamp_expire;
     struct bitcask_keydir_entry_sib * next;
 };
 typedef struct bitcask_keydir_entry_sib bitcask_keydir_entry_sib;
@@ -199,6 +202,7 @@ typedef struct
     uint64_t epoch;
     uint64_t offset;
     uint32_t tstamp;
+    uint32_t tstamp_expire;
     uint16_t is_tombstone;
     uint16_t key_sz;
     char *   key;
@@ -378,7 +382,7 @@ static ErlNifFunc nif_funcs[] =
     {"keydir_new", 1, bitcask_nifs_keydir_new1},
     {"maybe_keydir_new", 1, bitcask_nifs_maybe_keydir_new1},
     {"keydir_mark_ready", 1, bitcask_nifs_keydir_mark_ready},
-    {"keydir_put_int", 10, bitcask_nifs_keydir_put_int},
+    {"keydir_put_int", 11, bitcask_nifs_keydir_put_int},
     {"keydir_get_int", 3, bitcask_nifs_keydir_get_int},
     {"keydir_get_epoch", 1, bitcask_nifs_keydir_get_epoch},
     {"keydir_remove", 3, bitcask_nifs_keydir_remove},
@@ -409,7 +413,7 @@ static ErlNifFunc nif_funcs[] =
     {"file_position_int",  2, bitcask_nifs_file_position},
     {"file_seekbof_int", 1, bitcask_nifs_file_seekbof},
     {"file_truncate_int", 1, bitcask_nifs_file_truncate},
-    {"update_fstats", 8, bitcask_nifs_update_fstats},
+    {"update_fstats", 9, bitcask_nifs_update_fstats},
     {"set_pending_delete", 2, bitcask_nifs_set_pending_delete}
 };
 
@@ -560,7 +564,7 @@ ERL_NIF_TERM bitcask_nifs_keydir_mark_ready(ErlNifEnv* env, int argc, const ERL_
 }
 
 static void update_fstats(ErlNifEnv* env, bitcask_keydir* keydir,
-                          uint32_t file_id, uint32_t tstamp,
+                          uint32_t file_id, uint32_t tstamp, uint32_t tstamp_expire,
                           uint64_t expiration_epoch,
                           int32_t live_increment, int32_t total_increment,
                           int32_t live_bytes_increment, int32_t total_bytes_increment,
@@ -610,30 +614,37 @@ static void update_fstats(ErlNifEnv* env, bitcask_keydir* keydir,
     {
         entry->newest_tstamp = tstamp;
     }
+
+    if ((tstamp_expire != 0 && tstamp_expire < entry->oldest_tstamp_expire) ||
+        entry->oldest_tstamp_expire == 0)
+    {
+        entry->oldest_tstamp_expire = tstamp_expire;
+    }
 }
 
 // NIF wrapper around update_fstats().
 ERL_NIF_TERM bitcask_nifs_update_fstats(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
     bitcask_keydir_handle* handle;
-    uint32_t file_id, tstamp;
+    uint32_t file_id, tstamp, tstamp_expire;
     int32_t live_increment, total_increment;
     int32_t live_bytes_increment, total_bytes_increment;
     int32_t should_create;
 
-    if (argc == 8
+    if (argc == 9
             && enif_get_resource(env, argv[0], bitcask_keydir_RESOURCE,
                 (void**)&handle)
             && enif_get_uint(env, argv[1], &file_id)
             && enif_get_uint(env, argv[2], &tstamp)
-            && enif_get_int(env, argv[3], &live_increment)
-            && enif_get_int(env, argv[4], &total_increment)
-            && enif_get_int(env, argv[5], &live_bytes_increment)
-            && enif_get_int(env, argv[6], &total_bytes_increment)
-            && enif_get_int(env, argv[7], &should_create))
+            && enif_get_uint(env, argv[3], &tstamp_expire)
+            && enif_get_int(env, argv[4], &live_increment)
+            && enif_get_int(env, argv[5], &total_increment)
+            && enif_get_int(env, argv[6], &live_bytes_increment)
+            && enif_get_int(env, argv[7], &total_bytes_increment)
+            && enif_get_int(env, argv[8], &should_create))
     {
         LOCK(handle->keydir);
-        update_fstats(env, handle->keydir, file_id, tstamp, MAX_EPOCH,
+        update_fstats(env, handle->keydir, file_id, tstamp, tstamp_expire, MAX_EPOCH,
                 live_increment, total_increment,
                 live_bytes_increment, total_bytes_increment,
                 should_create);
@@ -658,7 +669,7 @@ ERL_NIF_TERM bitcask_nifs_set_pending_delete(ErlNifEnv* env, int argc,
             && enif_get_uint(env, argv[1], &file_id))
     {
         LOCK(handle->keydir);
-        update_fstats(env, handle->keydir, file_id, 0, handle->keydir->epoch,
+        update_fstats(env, handle->keydir, file_id, 0, 0, handle->keydir->epoch,
                 0, 0, 0, 0, 0);
         UNLOCK(handle->keydir);
         return ATOM_OK;
@@ -812,6 +823,7 @@ static int proxy_kd_entry_at_epoch(bitcask_keydir_entry* old,
         ret->total_sz = old->total_sz;
         ret->offset = old->offset;
         ret->tstamp = old->tstamp;
+        ret->tstamp_expire = old->tstamp_expire;
         ret->epoch = old->epoch;
         ret->key_sz = old->key_sz;
         ret->key = old->key;
@@ -843,6 +855,7 @@ static int proxy_kd_entry_at_epoch(bitcask_keydir_entry* old,
     ret->total_sz = s->total_sz;
     ret->offset = s->offset;
     ret->tstamp = s->tstamp;
+    ret->tstamp_expire = s->tstamp_expire;
     ret->is_tombstone = is_sib_tombstone(s);
     ret->epoch = s->epoch;
 
@@ -932,6 +945,7 @@ static void update_kd_entry_list(bitcask_keydir_entry *old,
         new_sib->offset = new->offset;
         new_sib->epoch = new->epoch;
         new_sib->tstamp = new->tstamp;
+        new_sib->tstamp_expire = new->tstamp_expire;
     }
     else // otherwise make a new sib
     {
@@ -942,6 +956,7 @@ static void update_kd_entry_list(bitcask_keydir_entry *old,
         new_sib->offset = new->offset;
         new_sib->epoch = new->epoch;
         new_sib->tstamp = new->tstamp;
+        new_sib->tstamp_expire = new->tstamp_expire;
         new_sib->next = h->sibs;
 
         h->sibs = new_sib;
@@ -968,6 +983,7 @@ static bitcask_keydir_entry* new_kd_entry_list(bitcask_keydir_entry *old,
     new_sib->offset = new->offset;
     new_sib->epoch = new->epoch;
     new_sib->tstamp = new->tstamp;
+    new_sib->tstamp_expire = new->tstamp_expire;
     new_sib->next = old_sib;
 
     //make new sib
@@ -976,6 +992,7 @@ static bitcask_keydir_entry* new_kd_entry_list(bitcask_keydir_entry *old,
     old_sib->offset = old->offset;
     old_sib->epoch = old->epoch;
     old_sib->tstamp = old->tstamp;
+    old_sib->tstamp_expire = old->tstamp_expire;
     old_sib->next = NULL;
 
     return MAKE_ENTRY_LIST_POINTER(ret);
@@ -1106,6 +1123,7 @@ static bitcask_keydir_entry* add_entry(bitcask_keydir* keydir,
     new_entry->offset = entry->offset;
     new_entry->epoch = entry->epoch;
     new_entry->tstamp = entry->tstamp;
+    new_entry->tstamp_expire = entry->tstamp_expire;
     new_entry->key_sz = entry->key_sz;
     memcpy(new_entry->key, entry->key, entry->key_sz);
     kh_put_set(entries, hash, new_entry);
@@ -1122,6 +1140,7 @@ static void update_regular_entry(bitcask_keydir_entry* cur_entry,
     cur_entry->epoch = upd_entry->epoch;
     cur_entry->offset = upd_entry->offset;
     cur_entry->tstamp = upd_entry->tstamp;
+    cur_entry->tstamp_expire = upd_entry->tstamp_expire;
 }
 
 // Updates an entry from the entries hash, not from pending.
@@ -1167,6 +1186,7 @@ static void update_entry(bitcask_keydir* keydir,
             new_entry->offset = upd_entry->offset;
             new_entry->epoch = upd_entry->epoch;
             new_entry->tstamp = upd_entry->tstamp;
+            new_entry->tstamp_expire = upd_entry->tstamp_expire;
             new_entry->key_sz = h->key_sz;
             memcpy(new_entry->key, h->key, h->key_sz);
             kh_key(keydir->entries, itr) = new_entry;
@@ -1261,6 +1281,7 @@ static void set_entry_tombstone(bitcask_keydir* keydir, khiter_t itr,
 {
     bitcask_keydir_entry_proxy tombstone;
     tombstone.tstamp = remove_time;
+    tombstone.tstamp_expire = remove_time;
     tombstone.epoch = remove_epoch;
     tombstone.offset = MAX_OFFSET;
     tombstone.total_sz = MAX_SIZE;
@@ -1335,7 +1356,8 @@ ERL_NIF_TERM bitcask_nifs_keydir_put_int(ErlNifEnv* env, int argc, const ERL_NIF
         enif_get_uint(env, argv[6], &(nowsec)) &&
         enif_get_uint(env, argv[7], &(newest_put)) &&
         enif_get_uint(env, argv[8], &(old_file_id)) &&
-        enif_get_uint64_bin(env, argv[9], &(old_offset)))
+        enif_get_uint64_bin(env, argv[9], &(old_offset)) &&
+        enif_get_uint(env, argv[10], &(entry.tstamp_expire)))
     {
         bitcask_keydir* keydir = handle->keydir;
         entry.key = (char*)key.data;
@@ -1403,8 +1425,8 @@ ERL_NIF_TERM bitcask_nifs_keydir_put_int(ErlNifEnv* env, int argc, const ERL_NIF
             }
 
             // Increment live and total stats.
-            update_fstats(env, keydir, entry.file_id, entry.tstamp, MAX_EPOCH,
-                          1, 1, entry.total_sz, entry.total_sz, 1);
+            update_fstats(env, keydir, entry.file_id, entry.tstamp, entry.tstamp_expire, 
+                    MAX_EPOCH, 1, 1, entry.total_sz, entry.total_sz, 1);
 
             put_entry(keydir, &f, &entry);
 
@@ -1459,16 +1481,16 @@ ERL_NIF_TERM bitcask_nifs_keydir_put_int(ErlNifEnv* env, int argc, const ERL_NIF
             // Remove the stats for the old entry and add the new
             if (f.proxy.file_id != entry.file_id) // different files
             {
-                update_fstats(env, keydir, f.proxy.file_id, 0, MAX_EPOCH,
+                update_fstats(env, keydir, f.proxy.file_id, 0, 0, MAX_EPOCH,
                               -1, 0,
                               -f.proxy.total_sz, 0, 0);
-                update_fstats(env, keydir, entry.file_id, entry.tstamp,
+                update_fstats(env, keydir, entry.file_id, entry.tstamp, entry.tstamp_expire,
                               MAX_EPOCH, 1, 1,
                               entry.total_sz, entry.total_sz, 1);
             }
             else // file_id is same, change live/total in one entry
             {
-                update_fstats(env, keydir, entry.file_id, entry.tstamp,
+                update_fstats(env, keydir, entry.file_id, entry.tstamp, entry.tstamp_expire,
                               MAX_EPOCH, 0, 1,
                               entry.total_sz - f.proxy.total_sz,
                               entry.total_sz, 1);
@@ -1486,7 +1508,7 @@ ERL_NIF_TERM bitcask_nifs_keydir_put_int(ErlNifEnv* env, int argc, const ERL_NIF
             // If not live yet, live stats are not updated, but total stats are
             if (!keydir->is_ready)
             {
-                update_fstats(env, keydir, entry.file_id, entry.tstamp,
+                update_fstats(env, keydir, entry.file_id, entry.tstamp, entry.tstamp_expire,
                               MAX_EPOCH, 0, 1, 0, entry.total_sz, 1);
             }
             DEBUG2("LINE %d put -> already_exists end\r\n", __LINE__);
@@ -1527,13 +1549,14 @@ ERL_NIF_TERM bitcask_nifs_keydir_get_int(ErlNifEnv* env, int argc, const ERL_NIF
         if (f.found && !f.proxy.is_tombstone)
         {
             ERL_NIF_TERM result;
-            result = enif_make_tuple6(env,
+            result = enif_make_tuple7(env,
                                       ATOM_BITCASK_ENTRY,
                                       argv[1], /* Key */
                                       enif_make_uint(env, f.proxy.file_id),
                                       enif_make_uint(env, f.proxy.total_sz),
                                       enif_make_uint64_bin(env, f.proxy.offset),
-                                      enif_make_uint(env, f.proxy.tstamp));
+                                      enif_make_uint(env, f.proxy.tstamp),
+                                      enif_make_uint(env, f.proxy.tstamp_expire));
             DEBUG(" ... returned value file id=%u size=%u ofs=%u tstamp=%u tomb=%u\r\n",
                   f.proxy.file_id, f.proxy.total_sz, f.proxy.offset, f.proxy.tstamp,
                   (unsigned)f.proxy.is_tombstone);
@@ -1632,7 +1655,7 @@ ERL_NIF_TERM bitcask_nifs_keydir_remove(ErlNifEnv* env, int argc, const ERL_NIF_
             }
 
             // Remove from file stats
-            update_fstats(env, keydir, fr.proxy.file_id, fr.proxy.tstamp,
+            update_fstats(env, keydir, fr.proxy.file_id, fr.proxy.tstamp, 0,
                           MAX_EPOCH, -1, 0, -fr.proxy.total_sz, 0, 0);
 
             // If found an entry in the pending hash, convert it to a tombstone
@@ -1936,13 +1959,14 @@ ERL_NIF_TERM bitcask_nifs_keydir_itr_next(ErlNifEnv* env, int argc, const ERL_NI
                 // TODO: If we maintained a ErlNifBinary in the original entry, could we
                 // get away with not doing a copy here?
                 memcpy(key.data, proxy.key, proxy.key_sz);
-                ERL_NIF_TERM curr = enif_make_tuple6(env,
+                ERL_NIF_TERM curr = enif_make_tuple7(env,
                                                      ATOM_BITCASK_ENTRY,
                                                      enif_make_binary(env, &key),
                                                      enif_make_uint(env, proxy.file_id),
                                                      enif_make_uint(env, proxy.total_sz),
                                                      enif_make_uint64_bin(env, proxy.offset),
-                                                     enif_make_uint(env, proxy.tstamp));
+                                                     enif_make_uint(env, proxy.tstamp),
+                                                     enif_make_uint(env, proxy.tstamp_expire));
 
                 // Update the iterator to the next entry
                 (handle->iterator)++;
@@ -2025,7 +2049,7 @@ ERL_NIF_TERM bitcask_nifs_keydir_info(ErlNifEnv* env, int argc, const ERL_NIF_TE
         // Dump fstats info into a list of [{file_id, live_keys, total_keys,
         //                                   live_bytes, total_bytes,
         //                                   oldest_tstamp, newest_tstamp,
-        //                                   expiration_epoch}]
+        //                                   expiration_epoch, oldest_tstamp_expire}]
         ERL_NIF_TERM fstats_list = enif_make_list(env, 0);
         khiter_t itr;
         bitcask_fstats_entry* curr_f;
@@ -2035,7 +2059,7 @@ ERL_NIF_TERM bitcask_nifs_keydir_info(ErlNifEnv* env, int argc, const ERL_NIF_TE
             {
                 curr_f = kh_val(keydir->fstats, itr);
                 ERL_NIF_TERM fstat =
-                    enif_make_tuple8(env,
+                    enif_make_tuple9(env,
                                      enif_make_uint(env, curr_f->file_id),
                                      enif_make_ulong(env, curr_f->live_keys),
                                      enif_make_ulong(env, curr_f->total_keys),
@@ -2043,7 +2067,8 @@ ERL_NIF_TERM bitcask_nifs_keydir_info(ErlNifEnv* env, int argc, const ERL_NIF_TE
                                      enif_make_ulong(env, curr_f->total_bytes),
                                      enif_make_uint(env, curr_f->oldest_tstamp),
                                      enif_make_uint(env, curr_f->newest_tstamp),
-                                     enif_make_uint64(env, (ErlNifUInt64)curr_f->expiration_epoch));
+                                     enif_make_uint64(env, (ErlNifUInt64)curr_f->expiration_epoch),
+                                     enif_make_uint(env, curr_f->oldest_tstamp_expire));
                 fstats_list = enif_make_list_cell(env, fstat, fstats_list);
             }
         }

@@ -1,10 +1,22 @@
+-define(TSTAMP_EXPIRE_KEY, tstamp_expire).
+-define(DEFAULT_TSTAMP_EXPIRE, 0).
+
+-define(DEFAULT_ENCODE_DISK_KEY_OPTS,
+    [
+        {?TSTAMP_EXPIRE_KEY, ?DEFAULT_TSTAMP_EXPIRE}
+    ]).
+
+-record(keyinfo, {
+    key = <<>> :: binary(),
+    tstamp_expire = ?DEFAULT_TSTAMP_EXPIRE :: integer()
+}).
 
 -record(bitcask_entry, { key :: binary(),
                          file_id :: integer(),
                          total_sz :: integer(),
                          offset :: integer() | binary(), 
-                         tstamp :: integer() }).
-
+                         tstamp :: integer(),
+                         tstamp_expire = 0 :: integer()}).
 
 %% @type filestate().
 -record(filestate, {mode :: 'read_only' | 'read_write',     % File mode: read_only, read_write
@@ -24,7 +36,8 @@
                       total_bytes :: integer(),
                       oldest_tstamp :: integer(),
                       newest_tstamp :: integer(),
-                      expiration_epoch :: non_neg_integer() }).
+                      expiration_epoch :: non_neg_integer(),
+                      oldest_tstamp_expire :: integer() }).
 
 
 -define(FMT(Str, Args), lists:flatten(io_lib:format(Str, Args))).
