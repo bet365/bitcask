@@ -21,13 +21,21 @@
 	get/3,
 	delete/2,
 	delete/3,
+	sync/1,
 	list_keys/2,
+	fold_keys/3,
 	fold_keys/4,
 	fold_keys/7,
 	merge/2,
 	special_merge/4,
+	needs_merge/1,
+	needs_merge/2,
 	make_bitcask_key/3,
-	check_and_upgrade_key/2
+	check_and_upgrade_key/2,
+	check_backend_exists/2,
+	is_active/2,
+	is_empty_estimate/1,
+	status/1
 ]).
 
 -include("bitcask.hrl").
@@ -124,7 +132,8 @@ open(Ref, Dir, Opts) ->
 			State1 = State#state{
 				open_instances 	= [{Split, BitcaskRef, false, IsActive} | OpenInstances],
 				open_dirs 		= [{Split, NewDir} | OpenDirs]},
-			erlang:put(Ref, State1);
+			erlang:put(Ref, State1),
+			Ref;
 		_ ->
 			io:format("Bitcask instance already open for Dir: ~p and Split: ~p~n", [Dir, Split]),
 			Ref
@@ -132,9 +141,10 @@ open(Ref, Dir, Opts) ->
 
 close(Ref) ->
 	State = erlang:get(Ref),
-	[bitcask:close(BitcaskRef) || {_, BitcaskRef, _, _} <- State#state.open_instances].
+	[bitcask:close(BitcaskRef) || {_, BitcaskRef, _, _} <- State#state.open_instances],
+	ok.
 
-activate_split(Split, Ref) ->
+activate_split(Ref, Split) ->
 	State = erlang:get(Ref),
 	{Split, SplitRef, HasMerged, IsActive} = lists:keyfind(Split, 1, State#state.open_instances),
 
@@ -153,7 +163,8 @@ activate_split(Split, Ref) ->
 							erlang:put(DefRef, NewDefState),
 							OpenInstances = lists:keydelete(Split, 1, State#state.open_instances),
 							NewState = State#state{open_instances = [{Split, SplitRef, HasMerged, true} | OpenInstances]},
-							erlang:put(Ref, NewState);
+							erlang:put(Ref, NewState),
+							Ref;
 						Error ->
 							throw({unrecorverable, Error})
 					end;
@@ -162,7 +173,8 @@ activate_split(Split, Ref) ->
 					erlang:put(DefRef, NewDefState),
 					OpenInstances = lists:keydelete(Split, 1, State#state.open_instances),
 					NewState = State#state{open_instances = [{Split, SplitRef, HasMerged, true} | OpenInstances]},
-					erlang:put(Ref, NewState)
+					erlang:put(Ref, NewState),
+					Ref
 			end
 	end.
 
@@ -175,16 +187,12 @@ get(Ref, {Bucket, Key}, Opts) ->
 get(Ref, Key1, Opts) ->
 	State = erlang:get(Ref),
 	OpenInstances = State#state.open_instances,
-%%	Split = ?FIND_SPLIT_FUN(Key1),
-	Split = proplists:get_value(split, Opts),
+	Split = proplists:get_value(split, Opts, default),
 
 	{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
 	DefState = erlang:get(DefRef),
 	{Split, SplitRef, _, _Active} = lists:keyfind(Split, 1, OpenInstances),
 	SplitState = erlang:get(SplitRef),
-
-%%	ct:pal("DefState: ~p~n", [DefState]),
-%%	ct:pal("SplitState: ~p~n", [SplitState]),
 
 	case Split of	%% Avoids us doing a lookup twice if the request is for default data
 		default ->
@@ -222,7 +230,7 @@ put(Ref, Key1, Value, Opts) ->
 
 	{Split, BitcaskRef, _HasMerged, IsActive} = lists:keyfind(Split, 1, OpenInstances),
 
-	%% Firstly we want to check if the file is ready to be put to, is not then put to default.
+	%% Firstly we want to check if the file is ready to be put to, if it is not then put to default.
 	%% If it is ready then perform a get of the object from the default location and delete it from there
 	%% if it exists.
 	case IsActive of
@@ -274,6 +282,12 @@ delete(Ref, Key, Opts) ->
 			end
 	end.
 
+sync(Ref) ->
+	State = erlang:get(Ref),
+	[bitcask:sync(BRef) || {_, BRef, _, _} <- State#state.open_instances],
+	ok.
+
+
 list_keys(Ref, Opts) ->
 	Split = proplists:get_value(split, Opts, default),
 	AllSplits = proplists:get_value(all_splits, Opts, false),
@@ -286,6 +300,9 @@ list_keys(Ref, Opts) ->
 			{Split, BitcaskRef, _, _} = lists:keyfind(Split, 1, OpenInstances),
 			bitcask:list_keys(BitcaskRef)
 	end.
+
+fold_keys(Ref, Fun, Acc) ->
+	fold_keys(Ref, Fun, Acc, []).
 
 fold_keys(Ref, Fun, Acc, Opts) ->
 	Split = proplists:get_value(split, Opts, default),
@@ -306,8 +323,13 @@ fold_keys(Ref, Fun, Acc, Opts, MaxAge, MaxPuts, SeeTombStoneP) ->
 
 	case AllSplits of
 		false ->
-			{Split, SplitRef, _, _} = lists:keyfind(Split, 1, OpenInstances),
-			bitcask:fold_keys(SplitRef, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP);
+			case lists:keyfind(Split, 1, OpenInstances) of
+				{Split, SplitRef, _, _} ->
+					bitcask:fold_keys(SplitRef, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP);
+				false ->
+					{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
+					bitcask:fold_keys(DefRef, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP)
+			end;
 		true ->
 			lists:flatten([bitcask:fold_keys(SplitRef, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP) || {_Split0, SplitRef, _, _} <- OpenInstances])
 	end.
@@ -360,6 +382,14 @@ special_merge(Ref, Split1, Split2, Opts) ->
 	bitcask_nifs:keydir_release(MState#mstate.origin_live_keydir),
 	bitcask_nifs:keydir_release(MState#mstate.destination_live_keydir),
 	ok = bitcask_lockops:release(MState#mstate.merge_lock).
+
+needs_merge(Ref) ->
+	needs_merge(Ref, []).
+needs_merge(Ref, Opts) ->
+	State = erlang:get(Ref),
+	Split = proplists:get_value(split, Opts, default),
+	{Split, BRef, _, _} = lists:keyfind(Split, 1, State#state.open_instances),
+	bitcask:needs_merge(BRef, Opts).
 
 merge_files(#mstate { input_files = [] } = State) ->
 	State;
@@ -667,6 +697,35 @@ check_and_upgrade_key(_Split, <<?VERSION_3:7, _Rest/bitstring>> = KeyDirKey) ->
 check_and_upgrade_key(_Split, KeyDirKey) ->
 	KeyDirKey.
 
+check_backend_exists(Ref, Key) ->
+	State = erlang:get(Ref),
+	case lists:keyfind(Key, 1, State#state.open_instances) of
+		false ->
+			false;
+		_ ->
+			true
+	end.
+
+is_active(Ref, Split) ->
+	State = erlang:get(Ref),
+	case lists:keyfind(Split, 1, State#state.open_instances) of
+		{Split, _BRef, _, Active} ->
+			Active;
+		false ->
+			throw({error, backend_does_not_exist})
+	end.
+
+%% TODO Both these calls need to be reviewed as to what they actually do and best way for riak to know which split to call on.
+is_empty_estimate(Ref) ->
+	State = erlang:get(Ref),
+	{default, BRef, _, _} = lists:keyfind(default, 1, State#state.open_instances),
+	bitcask:is_empty_estimate(BRef).
+
+status(Ref) ->
+	State = erlang:get(Ref),
+	{default, BRef, _, _} = lists:keyfind(default, 1, State#state.open_instances),
+	[bitcask:status(BRef)].
+%%	[bitcask:status(erlang:get(BRef)) || {_, BRef, _, _} <- OpenInstances].
 
 %% ===================================================================
 %% EUnit tests
@@ -747,7 +806,11 @@ manager_merge_test() ->
 
 %%	ct:pal("Reopened the instances: ~p~n", [erlang:get(C)]),
 
-	bitcask_manager:activate_split(second, B),
+	bitcask_manager:activate_split(B, second),
+
+	ct:pal("Activared backend, check if it is: ~p~n", [erlang:get(B)]),
+
+
 	bitcask_manager:special_merge(B, default, second, [{max_file_size, 1}]),
 
 	Files3 = bitcask_fileops:data_file_tstamps(DefDir2),
@@ -799,7 +862,7 @@ manager_merge_test() ->
 
 	bitcask_manager:merge(B, []),
 
-	bitcask_manager:put(B, Key8, <<"Value9">>, [{split, second}]),
+	bitcask_manager:put(B, Key8, <<"Value8">>, [{split, second}]),
 
 	ct:pal("Checking needs merge of defref2: ~p~n", [bitcask:readable_files(DefDir)]),
 	ct:pal("Checking needs merge of splitref2: ~p~n", [bitcask:readable_files(DefDir2)]),
