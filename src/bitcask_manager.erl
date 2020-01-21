@@ -26,7 +26,11 @@
 	fold_keys/3,
 	fold_keys/4,
 	fold_keys/7,
+	fold/3,
+	fold/4,
+	fold/7,
 	merge/2,
+	merge/3,
 	special_merge/4,
 	needs_merge/1,
 	needs_merge/2,
@@ -334,6 +338,40 @@ fold_keys(Ref, Fun, Acc, Opts, MaxAge, MaxPuts, SeeTombStoneP) ->
 			lists:flatten([bitcask:fold_keys(SplitRef, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP) || {_Split0, SplitRef, _, _} <- OpenInstances])
 	end.
 
+fold(Ref, Fun, Acc) ->
+	fold(Ref, Fun, Acc, []).
+
+fold(Ref, Fun, Acc, Opts) ->
+	Split = proplists:get_value(split, Opts, default),
+	State = erlang:get(Ref),
+	{Split, SplitRef, _, _} = lists:keyfind(Split, 1, State#state.open_instances),
+	SplitState = erlang:get(SplitRef),
+
+	MaxAge = bitcask:get_opt(max_fold_age, SplitState#bc_state.opts) * 1000, % convert from ms to us
+	MaxPuts = bitcask:get_opt(max_fold_puts, SplitState#bc_state.opts),
+	SeeTombstonesP = bitcask:get_opt(fold_tombstones, SplitState#bc_state.opts) /= undefined,
+
+	fold(Ref, Fun, Acc, Opts, MaxAge, MaxPuts, SeeTombstonesP).
+
+fold(Ref, Fun, Acc, Opts, MaxAge, MaxPut, SeeTombstonesP) ->
+	Split = proplists:get_value(split, Opts, default),
+	State = erlang:get(Ref),
+	OpenInstances = State#state.open_instances,
+	AllSplits = proplists:get_value(all_splits, Opts, false),
+
+	case AllSplits of
+		false ->
+			case lists:keyfind(Split, 1, OpenInstances) of
+				{Split, SplitRef, _, _} ->
+					bitcask:fold(SplitRef, Fun, Acc, MaxAge, MaxPut, SeeTombstonesP);
+				false ->
+					{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
+					bitcask:fold(DefRef, Fun, Acc, MaxAge, MaxPut, SeeTombstonesP)
+			end;
+		true ->
+			lists:flatten([bitcask:fold(SplitRef, Fun, Acc, MaxAge, MaxPut, SeeTombstonesP) || {_, SplitRef, _, _} <- OpenInstances])
+	end.
+
 %% TODO This is unfinished, need to check for `active` splits to merge.
 merge(Ref, Opts) ->
 	State = erlang:get(Ref),
@@ -344,6 +382,9 @@ merge(Ref, Opts) ->
 		 FilesToMerge = bitcask:readable_files(Dir),
 		 bitcask:merge(Dir, Opts, FilesToMerge)
 	 end || {_Split, Dir} <- OpenDirs].
+
+merge(Dirname, Opts, FilesToMerge) ->
+	bitcask:merge(Dirname, Opts, FilesToMerge).
 
 special_merge(Ref, Split1, Split2, Opts) ->
 	State = erlang:get(Ref),
@@ -387,9 +428,14 @@ needs_merge(Ref) ->
 	needs_merge(Ref, []).
 needs_merge(Ref, Opts) ->
 	State = erlang:get(Ref),
-	Split = proplists:get_value(split, Opts, default),
-	{Split, BRef, _, _} = lists:keyfind(Split, 1, State#state.open_instances),
-	bitcask:needs_merge(BRef, Opts).
+	Files = [{Split, bitcask:needs_merge(BRef, Opts)} || {Split, BRef, _, _} <- State#state.open_instances],
+	case [{X, Y} || {X, Y} <- Files, Y =/= false] of
+		[] ->
+			false;
+		NewFiles ->
+			NewFiles
+	end.
+
 
 merge_files(#mstate { input_files = [] } = State) ->
 	State;
@@ -797,6 +843,9 @@ manager_merge_test() ->
 	?assertEqual(MergeFiles, Files),
 	?assertEqual([], Files2),
 
+	delete(B, Key6, [{split, default}]),
+	{ok, <<"Value6">>} = bitcask_manager:get(B, Key6, [{split, second}]),
+
 	ct:pal("MergeFiles: ~p~n", [MergeFiles]),
 
 %%	bitcask_manager:close(B),
@@ -859,6 +908,8 @@ manager_merge_test() ->
 
 	ct:pal("Checking needs merge of defref: ~p~n", [bitcask:readable_files(DefDir)]),
 	ct:pal("Checking needs merge of splitref: ~p~n", [bitcask:readable_files(DefDir2)]),
+
+	ct:pal("==========Needs merge: ~p~n", [needs_merge(B)]),
 
 	bitcask_manager:merge(B, []),
 
