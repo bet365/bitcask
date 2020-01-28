@@ -45,7 +45,12 @@
          get_filestate/2,
          is_tombstone/1,
          wrap_write_file/1,
-         check_get/5]).
+         check_get/5,
+         get_decode_disk_key_fun/1,
+         readable_files/1,
+         expiry_time/1,
+         expiry_grace_time/1
+    ]).
 -export([has_pending_delete_bit/1]).                    % For EUnit tests
 
 -include_lib("kernel/include/file.hrl").
