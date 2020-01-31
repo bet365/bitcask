@@ -129,13 +129,14 @@ open(Ref, Dir, Opts) ->
 	OpenDirs = State#state.open_dirs,
 	Split = proplists:get_value(split, Opts, default),
 	IsActive = proplists:get_value(is_active, Opts, false),
+	HasMerged = proplists:get_value(has_merged, Opts, false),
 
 	case lists:keyfind(Split, 1, OpenInstances) of
 		false ->
 			NewDir = lists:concat([Dir, "/", atom_to_list(Split)]),
 			BitcaskRef = bitcask:open(NewDir, Opts),
 			State1 = State#state{
-				open_instances = [{Split, BitcaskRef, false, IsActive} | OpenInstances],
+				open_instances = [{Split, BitcaskRef, HasMerged, IsActive} | OpenInstances],
 				open_dirs = [{Split, NewDir} | OpenDirs]},
 			erlang:put(Ref, State1),
 			Ref;
