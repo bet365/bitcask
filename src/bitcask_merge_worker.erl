@@ -92,11 +92,17 @@ handle_call({merge, Args0}, _From, #state { queue = Q } = State) ->
             3 ->
                 %% presort opts and files tuples for better matches
                 %% and less work later
-                [_, Opts0, Tuple0] = Args0,
-                {Files, Expired} = Tuple0,
+                [_, Opts0, Files0] = Args0,
+                %%	[{splitname, {[], []}}]
+                case Files0 of
+                    {Files, Expired} ->
+                        Tuple = [{default, {lists:usort(Files), lists:usort(Expired)}}];
+                    F when is_list(Files0) ->
+                        Tuple = [{Split, {lists:sort(Files), lists:sort(Expired)}} ||{Split, {Files, Expired}} <- F]
+                end,
                 Opts = lists:usort(Opts0),
-                Tuple = {lists:usort(Files),
-                         lists:usort(Expired)},
+%%                Tuple = {lists:usort(Files),
+%%                         lists:usort(Expired)},
                 [Dirname, Opts, Tuple];
             _ ->
                 %% whole directory don't need to be sorted
@@ -194,7 +200,7 @@ do_merge(Args) ->
     case in_merge_window(Hour, merge_window()) of
         true ->
             Start = os:timestamp(),
-            Result = (catch apply(bitcask, merge, Args)),
+            Result = (catch apply(bitcask_manager, merge, Args)),
             ElapsedSecs = timer:now_diff(os:timestamp(), Start) / 1000000,
             [_,_,Args3] = Args,
             case Result of

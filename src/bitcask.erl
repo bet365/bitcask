@@ -869,6 +869,7 @@ needs_merge(Ref, Opts) ->
     #bc_state{dirname=Dirname} = State,
     %% Update state with live files
     put_state(Ref, State#bc_state { read_files = LiveFiles }),
+    ct:pal("Summary info: ~p~n", [Summary]), %%TODO Check why the summary doesnt contain file 14(activated one)
     Result0 =
         case explicit_merge_files(Dirname) of
             [] ->
