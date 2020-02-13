@@ -204,12 +204,12 @@ do_merge(Args) ->
             ElapsedSecs = timer:now_diff(os:timestamp(), Start) / 1000000,
             [_,_,Args3] = Args,
             case Result of
-                ok ->
-                    error_logger:info_msg("Merged ~p in ~p seconds.\n",
-                                          [Args3, ElapsedSecs]);
                 {Error, Reason} when Error == error; Error == 'EXIT' ->
                     error_logger:error_msg("Failed to merge ~p: ~p\n",
-                                           [Args3, Reason])
+                                           [Args3, Reason]);
+                X when is_list(X) ->
+                    error_logger:info_msg("Merged ~p in ~p seconds.\n",
+                                           [Args3, ElapsedSecs])
             end;
         false ->
             ok
