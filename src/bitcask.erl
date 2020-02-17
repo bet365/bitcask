@@ -31,8 +31,8 @@
          delete/3,
          sync/1,
          list_keys/1,
-         fold_keys/3, fold_keys/6,
-         fold/3, fold/6,
+         fold_keys/3, fold_keys/4, fold_keys/6, fold_keys/7,
+         fold/3, fold/4, fold/6, fold/7,
          iterator/3, iterator_next/1, iterator_release/1,
          merge/1, merge/2, merge/3,
          needs_merge/1,
@@ -345,10 +345,12 @@ list_keys(Ref) ->
 -spec fold_keys(reference(), Fun::fun(), Acc::term()) ->
                                                        term() | {error, any()}.
 fold_keys(Ref, Fun, Acc0) ->
+    fold_keys(Ref, Fun, Acc0, []).
+fold_keys(Ref, Fun, Acc0, Opts) ->
     State = get_state(Ref),
     MaxAge = get_opt(max_fold_age, State#bc_state.opts) * 1000, % convert from ms to us
     MaxPuts = get_opt(max_fold_puts, State#bc_state.opts),
-    fold_keys(Ref, Fun, Acc0, MaxAge, MaxPuts, false).
+    fold_keys(Ref, Fun, Acc0, MaxAge, MaxPuts, false, Opts).
 
 %% @doc Fold over all keys in a bitcask datastore with limits on how out of date
 %%      the keydir is allowed to be.
@@ -356,13 +358,18 @@ fold_keys(Ref, Fun, Acc0) ->
 -spec fold_keys(reference(), Fun::fun(), Acc::term(), non_neg_integer() | undefined,
                 non_neg_integer() | undefined, boolean()) ->
                                                 term() | {error, any()}.
-fold_keys(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
+fold_keys(Ref ,Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
+    fold_keys(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP, []).
+fold_keys(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP, Opts) ->
     %% Fun should be of the form F(#bitcask_entry, A) -> A
     ExpiryTime = expiry_time((get_state(Ref))#bc_state.opts),
     RealFun = fun(BCEntry, Acc) ->
         Key = BCEntry#bitcask_entry.key,
-        case BCEntry#bitcask_entry.tstamp < ExpiryTime orelse 
-             is_key_expired(BCEntry#bitcask_entry.tstamp_expire) of
+        TTLExpired = BCEntry#bitcask_entry.tstamp < ExpiryTime,
+        TStampExpired = BCEntry#bitcask_entry.tstamp_expire,
+        IsKeyExpired =
+            ttl_expired_or_key(TTLExpired, TStampExpired, Opts),
+        case IsKeyExpired of
             true ->
                 Acc;
             false ->
@@ -384,19 +391,29 @@ fold_keys(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
     end,
     bitcask_nifs:keydir_fold((get_state(Ref))#bc_state.keydir, RealFun, Acc0, MaxAge, MaxPut).
 
+ttl_expired_or_key(TTLExpired, TstampExpired, Opts) ->
+    IgnoreTstampExpireKeys = proplists:get_value(ignore_tstamp_expire_keys, Opts, false),
+    IsKeyExpired = is_key_expired(TstampExpired) orelse IgnoreTstampExpireKeys,
+    TTLExpired orelse IsKeyExpired.
+%% true = key is expired, ignore_tstamp_expire_keys is false.
+%% false = key is expired, ignore_tstamp_expire_keys is true
+
 %% @doc fold over all K/V pairs in a bitcask datastore.
 %% Fun is expected to take F(K,V,Acc0) -> Acc
 -spec fold(reference() | tuple(),
            fun((binary(), binary(), any()) -> any()),
            any()) -> any() | {error, any()}.
-fold(Ref, Fun, Acc0) when is_reference(Ref)->
+
+fold(Ref, Fun, Acc) ->
+    fold(Ref, Fun , Acc, []).
+fold(Ref, Fun, Acc0, Opts) when is_reference(Ref)->
     State = get_state(Ref),
-    fold(State, Fun, Acc0);
-fold(State, Fun, Acc0) ->
+    fold(State, Fun, Acc0, Opts);
+fold(State, Fun, Acc0, Opts) ->
     MaxAge = get_opt(max_fold_age, State#bc_state.opts) * 1000, % convert from ms to us
     MaxPuts = get_opt(max_fold_puts, State#bc_state.opts),
     SeeTombstonesP = get_opt(fold_tombstones, State#bc_state.opts) /= undefined,
-    fold(State, Fun, Acc0, MaxAge, MaxPuts, SeeTombstonesP).
+    fold(State, Fun, Acc0, MaxAge, MaxPuts, SeeTombstonesP, Opts).
 
 %% @doc fold over all K/V pairs in a bitcask datastore specifying max age/updates of
 %% the frozen keystore.
@@ -404,10 +421,12 @@ fold(State, Fun, Acc0) ->
 -spec fold(reference() | tuple(), fun((binary(), binary(), any()) -> any()), any(),
            non_neg_integer() | undefined, non_neg_integer() | undefined, boolean()) ->
                   any() | {error, any()}.
-fold(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) when is_reference(Ref)->
+fold(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombStonesP) ->
+    fold(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombStonesP, []).
+fold(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP, Opts) when is_reference(Ref)->
     State = get_state(Ref),
-    fold(State, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP);
-fold(State, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
+    fold(State, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP, Opts);
+fold(State, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP, Opts) ->
     DecodeDiskKeyFun = State#bc_state.decode_disk_key_fun,
     FrozenFun =
         fun() ->
@@ -430,11 +449,13 @@ fold(State, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
                                                                     [K0, KeyTxErr1]),
                                              Acc;
                                          #keyinfo{key = K1, tstamp_expire = TstampExpire} ->
-                                             case {K1, (TStamp < ExpiryTime orelse 
-                                                is_key_expired(TstampExpire))} of
-                                                 {_, true} ->
+
+                                             TTLExpired = TStamp < ExpiryTime,
+                                             IsKeyExpired = ttl_expired_or_key(TTLExpired, TstampExpire, Opts),
+                                             case IsKeyExpired of
+                                                 true ->
                                                      Acc;
-                                                 {_, false} ->
+                                                 false ->
                                                      case bitcask_nifs:keydir_get(
                                                             State#bc_state.keydir, K1,
                                                             FoldEpoch) of
