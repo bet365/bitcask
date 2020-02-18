@@ -31,8 +31,8 @@
          delete/3,
          sync/1,
          list_keys/1,
-         fold_keys/3, fold_keys/4, fold_keys/6, fold_keys/7,
-         fold/3, fold/4, fold/6, fold/7,
+         fold_keys/3, fold_keys/4,
+         fold/3, fold/4,
          iterator/3, iterator_next/1, iterator_release/1,
          merge/1, merge/2, merge/3,
          needs_merge/1,
@@ -350,17 +350,7 @@ fold_keys(Ref, Fun, Acc0, Opts) ->
     State = get_state(Ref),
     MaxAge = get_opt(max_fold_age, State#bc_state.opts) * 1000, % convert from ms to us
     MaxPuts = get_opt(max_fold_puts, State#bc_state.opts),
-    fold_keys(Ref, Fun, Acc0, MaxAge, MaxPuts, false, Opts).
-
-%% @doc Fold over all keys in a bitcask datastore with limits on how out of date
-%%      the keydir is allowed to be.
-%% Must be able to understand the bitcask_entry record form.
--spec fold_keys(reference(), Fun::fun(), Acc::term(), non_neg_integer() | undefined,
-                non_neg_integer() | undefined, boolean()) ->
-                                                term() | {error, any()}.
-fold_keys(Ref ,Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP) ->
-    fold_keys(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP, []).
-fold_keys(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP, Opts) ->
+    SeeTombstonesP = get_opt(fold_tombstones, State#bc_state.opts) /= undefined,
     %% Fun should be of the form F(#bitcask_entry, A) -> A
     ExpiryTime = expiry_time((get_state(Ref))#bc_state.opts),
     RealFun = fun(BCEntry, Acc) ->
@@ -389,7 +379,7 @@ fold_keys(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP, Opts) ->
                 end
         end
     end,
-    bitcask_nifs:keydir_fold((get_state(Ref))#bc_state.keydir, RealFun, Acc0, MaxAge, MaxPut).
+    bitcask_nifs:keydir_fold((get_state(Ref))#bc_state.keydir, RealFun, Acc0, MaxAge, MaxPuts).
 
 ttl_expired_or_key(TTLExpired, TstampExpired, Opts) ->
     IgnoreTstampExpireKeys = proplists:get_value(ignore_tstamp_expire_keys, Opts, false),
@@ -413,20 +403,6 @@ fold(State, Fun, Acc0, Opts) ->
     MaxAge = get_opt(max_fold_age, State#bc_state.opts) * 1000, % convert from ms to us
     MaxPuts = get_opt(max_fold_puts, State#bc_state.opts),
     SeeTombstonesP = get_opt(fold_tombstones, State#bc_state.opts) /= undefined,
-    fold(State, Fun, Acc0, MaxAge, MaxPuts, SeeTombstonesP, Opts).
-
-%% @doc fold over all K/V pairs in a bitcask datastore specifying max age/updates of
-%% the frozen keystore.
-%% Fun is expected to take F(K,V,Acc0) -> Acc
--spec fold(reference() | tuple(), fun((binary(), binary(), any()) -> any()), any(),
-           non_neg_integer() | undefined, non_neg_integer() | undefined, boolean()) ->
-                  any() | {error, any()}.
-fold(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombStonesP) ->
-    fold(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombStonesP, []).
-fold(Ref, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP, Opts) when is_reference(Ref)->
-    State = get_state(Ref),
-    fold(State, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP, Opts);
-fold(State, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP, Opts) ->
     DecodeDiskKeyFun = State#bc_state.decode_disk_key_fun,
     FrozenFun =
         fun() ->
@@ -490,7 +466,7 @@ fold(State, Fun, Acc0, MaxAge, MaxPut, SeeTombstonesP, Opts) ->
             end
         end,
     KeyDir = State#bc_state.keydir,
-    bitcask_nifs:keydir_frozen(KeyDir, FrozenFun, MaxAge, MaxPut).
+    bitcask_nifs:keydir_frozen(KeyDir, FrozenFun, MaxAge, MaxPuts).
 
 %%
 %% Get a list of readable files and attempt to open them for a fold. If we can't
@@ -3511,12 +3487,16 @@ no_tombstones_after_reopen_test2(DeleteHintFilesP) ->
             ok
     end,
 
-    B2 = bitcask:open(Dir, [read_write, {max_file_size, MaxFileSize}]),
+    BitcaskOpts = [{max_fold_age, -1},
+                   {max_fold_puts, -1},
+                   {max_file_size, MaxFileSize},
+                   {fold_tombstones, true}],
+    B2 = bitcask:open(Dir, [read_write|BitcaskOpts]),
 
-    Res1 = bitcask:fold(B2, fun(K, _V, Acc0) -> [K|Acc0] end, [], -1, -1, true),
+    Res1 = bitcask:fold(B2, fun(K, _V, Acc0) -> [K|Acc0] end, []),
     ?assertNotEqual([], [X || {tombstone, _} = X <- Res1]),
 
-    Res2 = bitcask:fold_keys(B2, fun(K, Acc0) -> [K|Acc0] end, [], -1, -1, true),
+    Res2 = bitcask:fold_keys(B2, fun(K, Acc0) -> [K|Acc0] end, []),
     ?assertEqual([], [X || {tombstone, _} = X <- Res2]),
     ok = bitcask:close(B2).
 
@@ -3576,10 +3556,13 @@ no_crash_on_key_transform_test() ->
     CrashTx = fun(_K) ->
                       throw(naughty_key_transform_failure)
               end,
-    B = init_dataset(Dir, [read_write, {key_transform, CrashTx}],
-                     default_dataset()),
+    BOpts = [{max_fold_age, -1},
+             {max_fold_puts, -1},
+             {fold_tombstones, true},
+             {key_transform, CrashTx}],
+    B = init_dataset(Dir, [read_write|BOpts], default_dataset()),
     bitcask:list_keys(B),
-    bitcask:fold(B, fun(K, _V, Acc0) -> [K|Acc0] end, [], -1, -1, true),
+    bitcask:fold(B, fun(K, _V, Acc0) -> [K|Acc0] end, []),
     bitcask:merge(Dir, [{key_transform, CrashTx}]),
     ok = bitcask:close(B),
     B2 = bitcask:open(Dir, [{key_transform, CrashTx}]),
