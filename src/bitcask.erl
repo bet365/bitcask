@@ -2268,7 +2268,10 @@ fold_corrupt_file_test2() ->
     [File1] = CreateFun(DataList),
     FoldFun = fun (K, V, Acc) -> [{K, V} | Acc] end,
 
-    B2 = bitcask:open(TestDir),
+    BOpts = [{max_fold_puts, -1},{max_fold_age, -1}],
+
+    B2 = bitcask:open(TestDir,BOpts),
+
     ?assertEqual(DataList, bitcask:fold(B2, FoldFun,[])),
     close(B2),
 
@@ -2279,7 +2282,7 @@ fold_corrupt_file_test2() ->
     file:close(F),
     {ok, File1After} = file:read_file(File1),
     ?assert(File1Before /= File1After),
-    B3 = bitcask:open(TestDir),
+    B3 = bitcask:open(TestDir, BOpts),
     ?assertEqual(DataList, bitcask:fold(B3, FoldFun,[])),
     close(B3),
 
@@ -2292,7 +2295,7 @@ fold_corrupt_file_test2() ->
     file:close(F2),
     {ok, File2After} = file:read_file(File2),
     ?assert(File2Before /= File2After),
-    B4 = bitcask:open(TestDir),
+    B4 = bitcask:open(TestDir, BOpts),
     ?assertEqual(DataList, bitcask:fold(B4, FoldFun,[])),
     close(B4),
 
@@ -2311,7 +2314,7 @@ fold_corrupt_file_test2() ->
     ok = file:close(F3),
     {ok, File3After} = file:read_file(File3),
     ?assert(File3Before /= File3After),
-    B5 = bitcask:open(TestDir),
+    B5 = bitcask:open(TestDir, BOpts),
     LoadedKeys = bitcask:list_keys(B5),
     ?assertEqual([<<"k1">>], LoadedKeys),
     bitcask:close(B5),
@@ -2344,7 +2347,8 @@ fold_visits_frozen_test_() ->
 fold_visits_frozen_test2(RollOver) ->
     Cask = "/tmp/bc.test.frozenfold." ++ atom_to_list(RollOver),
     os:cmd("rm -r " ++ Cask),
-    B = init_dataset(Cask, default_dataset()),
+    BOpts = [{max_fold_age, -1}, {max_fold_puts, -1}],
+    B = init_dataset(Cask, BOpts, default_dataset()),
     try
         Ref = (get_state(B))#bc_state.keydir,
         Me = self(),
@@ -2397,7 +2401,7 @@ fold_visits_frozen_test2(RollOver) ->
                              [{K, V} | Acc]
                      end,
         %% force fold over the frozen keydir
-        L = fold(B, CollectAll, [], -1, -1, false),
+        L = fold(B, CollectAll, []),
         ?assertEqual(default_dataset(), lists:sort(L)),
 
         %% Unfreeze the keydir, waiting until complete
@@ -2407,7 +2411,7 @@ fold_visits_frozen_test2(RollOver) ->
         %% test state, instead of using sleeps.
         timer:sleep(900),
         %% Check we see the updated fold
-        L2 = fold(B, CollectAll, [], -1, -1, false),
+        L2 = fold(B, CollectAll, []),
         ?assertEqual([{<<"k2">>,<<"v2-2">>},
                       {<<"k3">>,<<"v3">>},
                       {<<"k4">>,<<"v4">>}], lists:sort(L2))
@@ -2439,9 +2443,10 @@ slow_worker() ->
                           end,
                           [{K, V} | Acc]
                   end,
-    B = bitcask:open("/tmp/bc.test.unfrozenfold"),
+    BOpts = [{max_fold_age,-1},{max_fold_puts,-1}],
+    B = bitcask:open("/tmp/bc.test.unfrozenfold", BOpts),
     Owner ! ready,
-    L = fold(B, SlowCollect, [], -1, -1, false),
+    L = fold(B, SlowCollect, []),
     case Values =:= lists:sort(L) of
         true ->
             Owner ! done;
@@ -2469,7 +2474,8 @@ fold_visits_unfrozen_test2(RollOver) ->
     os:cmd("rm -r "++Cask),
 
     bitcask_time:test__set_fudge(1),
-    B = init_dataset(Cask, default_dataset()),
+    BOpts = [{max_fold_age, -1}, {max_fold_puts, -1}],
+    B = init_dataset(Cask, BOpts, default_dataset()),
     try
         Pid = spawn(fun slow_worker/0),
         Pid ! {owner, self(), default_dataset()},
@@ -2512,7 +2518,7 @@ fold_visits_unfrozen_test2(RollOver) ->
         end,
 
         %% Check we see the updated fold
-        L2 = fold(B, CollectAll, [], -1, -1, false),
+        L2 = fold(B, CollectAll, []),
         ?assertEqual([{<<"k2">>,<<"v2-2">>},
                       {<<"k3">>,<<"v3">>},
                       {<<"k4">>,<<"v4">>}], lists:sort(L2))
@@ -2601,7 +2607,8 @@ bitfold_test2() ->
     ok = bitcask:delete(B,<<"k">>),
     ok = bitcask:put(B, <<"k7">>,<<"v7">>),
     close(B),
-    B2 = bitcask:open("/tmp/bc.test.bitfold"),
+    BOpts = [{max_fold_puts, -1},{max_fold_age, -1}],
+    B2 = bitcask:open("/tmp/bc.test.bitfold", BOpts),
     true = ([{<<"k7">>,<<"v7">>},{<<"k2">>,<<"v2">>}] =:=
             bitcask:fold(B2,fun(K,V,Acc) -> [{K,V}|Acc] end,[])),
     close(B2),
@@ -3249,8 +3256,9 @@ slow_folder(Cask) ->
                           end,
                           [{K, V} | Acc]
                   end,
-    B = bitcask:open(Cask),
-    L = fold(B, SlowCollect, [], -1, -1, false),
+    BOpts = [{max_fold_age, -1}, {max_fold_puts, -1}],
+    B = bitcask:open(Cask, BOpts),
+    L = fold(B, SlowCollect, []),
     Owner ! {slow_folder_done, self(), L},
     bitcask:close(B).
 
@@ -3278,14 +3286,15 @@ freeze_close_reopen() ->
     Data2 = [{<<K:32>>, <<(K+1):32>>} ||
                 K <- lists:seq(1, Keys*5),
                 K /= DelKey],
-    B = init_dataset(Cask, Data),
+    BOpts = [{max_fold_age, -1}, {max_fold_puts, -1}],
+    B = init_dataset(Cask, BOpts, Data),
     try
         CollectAll = fun(K, V, Acc) -> [{K, V} | Acc] end,
         PutData = fun(DataList) -> [begin ok = put(B, K, V) end ||
                                        {K, V} <- DataList]
                   end,
 
-        ?assertEqual(Data, lists:sort(fold(B, CollectAll, [], -1, -1, false))),
+        ?assertEqual(Data, lists:sort(fold(B, CollectAll, []))),
         if true ->
                 State = get_state(B),
                 put_state(B, State#bc_state{max_file_size = 0})
@@ -3317,7 +3326,7 @@ freeze_close_reopen() ->
         not_found = get(B, <<DelKey:32>>),
 
         ok = close(B),
-        B2 = open(Cask, [read_write]),
+        B2 = open(Cask, [read_write|BOpts]),
         [{ok, V} = get(B2, K) || {K, V} <- Data2],
         not_found = get(B2, <<DelKey:32>>),
         %% It is too difficult here to figure out what fold would tell
@@ -3345,7 +3354,7 @@ freeze_close_reopen() ->
                      lists:sort(L1a) -- [FirstItemFound]),
 
         %% Check that we see the updated data yet again
-        L3 = fold(B2, CollectAll, [], -1, -1, false),
+        L3 = fold(B2, CollectAll, []),
         ?assertEqual(Data2, lists:sort(L3)),
         [{ok, V} = get(B2, K) || {K, V} <- Data2],
         not_found = get(B2, <<DelKey:32>>),
