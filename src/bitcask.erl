@@ -49,7 +49,9 @@
          get_decode_disk_key_fun/1,
          readable_files/1,
          expiry_time/1,
-         expiry_grace_time/1
+         expiry_grace_time/1,
+         is_key_expired/1,
+         out_of_date/9
     ]).
 -export([has_pending_delete_bit/1]).                    % For EUnit tests
 
@@ -869,7 +871,6 @@ needs_merge(Ref, Opts) ->
     #bc_state{dirname=Dirname} = State,
     %% Update state with live files
     put_state(Ref, State#bc_state { read_files = LiveFiles }),
-    ct:pal("Summary info: ~p~n", [Summary]), %%TODO Check why the summary doesnt contain file 14(activated one)
     Result0 =
         case explicit_merge_files(Dirname) of
             [] ->
