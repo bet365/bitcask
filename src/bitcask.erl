@@ -381,10 +381,15 @@ fold_keys(Ref, Fun, Acc0, Opts) ->
     end,
     bitcask_nifs:keydir_fold((get_state(Ref))#bc_state.keydir, RealFun, Acc0, MaxAge, MaxPuts).
 
+
 ttl_expired_or_key(TTLExpired, TstampExpired, Opts) ->
-    IgnoreTstampExpireKeys = proplists:get_value(ignore_tstamp_expire_keys, Opts, false),
-    IsKeyExpired = is_key_expired(TstampExpired) orelse IgnoreTstampExpireKeys,
-    TTLExpired orelse IsKeyExpired.
+    IsKeyExpired = is_key_expired(TstampExpired),
+    TTLExpired orelse IsKeyExpired orelse ignore_keys_with_expiry(TstampExpired, Opts).
+
+ignore_keys_with_expiry(0, _Opts) ->
+    false;
+ignore_keys_with_expiry(_, Opts) ->
+    proplists:get_value(ignore_tstamp_expire_keys, Opts, false).
 %% true = key is expired, ignore_tstamp_expire_keys is false.
 %% false = key is expired, ignore_tstamp_expire_keys is true
 
@@ -4226,5 +4231,69 @@ expired_keys_partial_merge_1_test() ->
     bitcask:merge(Dir, BitcaskOpts, FilesToMerge2),
     check_partial_merge(Ref1, Expected),
     bitcask:close(Ref1).
-    
+
+filter_expired_keys_test() ->
+    Dir = "/tmp/bc.filter.expired.keys.0",
+    os:cmd(?FMT("rm -rf ~s", [Dir])),
+
+    EncodeDiskKeyFun =
+        fun(<<K/binary>>, Opts) ->
+            TStampExpire = proplists:get_value(?TSTAMP_EXPIRE_KEY, Opts, 0),
+            <<TStampExpire:32/integer, K/binary>>
+        end,
+    DecodeDiskKeyFun =
+        fun(<<TStampExpire:32/integer, K/binary>>) ->
+                #keyinfo{key = K, tstamp_expire = TStampExpire}
+        end,
+    BitcaskOpts =
+        [
+            {decode_disk_key_fun, DecodeDiskKeyFun},
+            {encode_disk_key_fun, EncodeDiskKeyFun},
+            {max_fold_age, -1},
+            {max_file_size, 9900},
+            {small_file_threshold, disabled}
+        ],
+    Ref0 = bitcask:open(Dir, [read_write] ++ BitcaskOpts),
+
+    Value = <<0:64/integer-unit:8>>,
+    WithExpiry = bitcask_time:tstamp() + 1000,
+    WithExpired = bitcask_time:tstamp() - 1000,
+
+    NormalPuts1 = [ {<<N:32>>, Value, []} || N <- lists:seq(2000, 2050)],
+    NormalPuts2 = [ {<<N:32>>, Value, []} || N <- lists:seq(1, 300)],
+    ExpiryDeletes1 = [ {<<N:32>>, Value, [{?TSTAMP_EXPIRE_KEY, WithExpiry}]} || N <- lists:seq(2051,2100)],
+    ExpiryDeletes2 = [ {<<N:32>>, Value, [{?TSTAMP_EXPIRE_KEY, WithExpiry}]} || N <- lists:seq(301,600)],
+    ExpiredDeletes1 = [ {<<N:32>>, Value, [{?TSTAMP_EXPIRE_KEY, WithExpired}]} || N <- lists:seq(2101,2150)],
+    ExpiredDeletes2 = [ {<<N:32>>, Value, [{?TSTAMP_EXPIRE_KEY, WithExpired}]} || N <- lists:seq(601,900)],
+    %% put keys in random order
+
+    KeyValues = NormalPuts1++NormalPuts2++ExpiryDeletes1++ExpiryDeletes2++ExpiredDeletes1++ExpiredDeletes2,
+    ExpectedKeysFun = fun(KVs) -> [Key || {Key, _, _} <- KVs] end,
+
+    %% Put all entries
+    put_entries(Ref0, KeyValues),
+
+    IgnoreExpiryTrue = [{ignore_tstamp_expire_keys, true}],
+    IgnoreExpiryFalse = [],
+    Acc0  = [],
+    FoldFun = fun(K,_,Acc) -> [K|Acc] end,
+
+    %% ignore_tstamp_expire_keys is true. So ignores all keys with expiry
+    ReturnedKeys1 = bitcask:fold(Ref0, FoldFun, Acc0, IgnoreExpiryTrue),
+    %% result should be all the keys that that have no expiry.
+    Expected1 = ExpectedKeysFun(NormalPuts1++NormalPuts2),
+    ?assert(length(ReturnedKeys1) == length(Expected1)),
+    ?assertEqual(lists:sort(ReturnedKeys1), lists:sort(Expected1)),
+
+    %% ignore_tstamp_expire_keys is false, so keys with an expiry is returned,
+    %% but the expired ones are not.
+    ReturnedKeys2 = bitcask:fold(Ref0, FoldFun, Acc0, IgnoreExpiryFalse),
+    %% result should be all the keys without expiry and with expiry, but not if actually expired
+    Expected2 = ExpectedKeysFun(NormalPuts1++NormalPuts2++ExpiryDeletes1++ExpiryDeletes2),
+    ?assert(length(ReturnedKeys2) == length(Expected2)),
+    ?assertEqual(lists:sort(ReturnedKeys2), lists:sort(Expected2)),
+
+    bitcask:close(Ref0).
+
+
 -endif.
