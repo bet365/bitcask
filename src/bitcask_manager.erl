@@ -316,7 +316,6 @@ sync(Ref) ->
 	[bitcask:sync(BRef) || {_, BRef, _, _} <- State#state.open_instances],
 	ok.
 
-
 list_keys(Ref, Opts) ->
 	Split = proplists:get_value(split, Opts, default),
 	AllSplits = proplists:get_value(all_splits, Opts, false),
@@ -371,7 +370,13 @@ fold_keys(Ref, Fun, Acc, Opts, MaxAge, MaxPuts, SeeTombStoneP) ->
 					end
 			end;
 		true ->
-			lists:flatten([bitcask:fold_keys(SplitRef0, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP) || {_Split0, SplitRef0, _, SplitActive} <- OpenInstances, SplitActive =:= true])
+			case [bitcask:fold_keys(SplitRef0, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP) || {_Split0, SplitRef0, _, SplitActive} <- OpenInstances, SplitActive =:= true] of
+				Acc1 when is_tuple(hd(Acc1)) ->
+					OutPut = lists:flatten([X || {X, _} <- Acc1]),
+					{OutPut, element(2, hd(Acc1))};
+				Acc1 when is_list(hd(Acc1)) ->
+					lists:flatten(Acc1)
+			end
 	end.
 
 fold(Ref, Fun, Acc) ->
@@ -393,19 +398,30 @@ fold(Ref, Fun, Acc, Opts, MaxAge, MaxPut, SeeTombstonesP) ->
 	Split = proplists:get_value(split, Opts, default),
 	State = erlang:get(Ref),
 	OpenInstances = State#state.open_instances,
+	{Split, SplitRef, HasMerged, Active} = lists:keyfind(Split, 1, OpenInstances),
 	AllSplits = proplists:get_value(all_splits, Opts, false),
-
 	case AllSplits of
 		false ->
-			case lists:keyfind(Split, 1, OpenInstances) of
-				{Split, SplitRef, _, _} ->
-					bitcask:fold(SplitRef, Fun, Acc, MaxAge, MaxPut, SeeTombstonesP);
+			case Active of
 				false ->
 					{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
-					bitcask:fold(DefRef, Fun, Acc, MaxAge, MaxPut, SeeTombstonesP)
+					bitcask:fold(DefRef, Fun, Acc, MaxAge, MaxPut, SeeTombstonesP);
+				true when Split =:= default ->
+					{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
+					bitcask:fold(DefRef, Fun, Acc, MaxAge, MaxPut, SeeTombstonesP);
+				true ->
+					case HasMerged of
+						false ->
+							{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
+							DefKeys = bitcask:fold(DefRef, Fun, Acc, MaxAge, MaxPut, SeeTombstonesP),
+							SplitKeys = bitcask:fold(SplitRef, Fun, Acc, MaxAge, MaxPut, SeeTombstonesP),
+							lists:flatten([DefKeys, SplitKeys]);
+						true ->
+							bitcask:fold(SplitRef, Fun, Acc, MaxAge, MaxPut, SeeTombstonesP)
+					end
 			end;
 		true ->
-			lists:flatten([bitcask:fold(SplitRef, Fun, Acc, MaxAge, MaxPut, SeeTombstonesP) || {_, SplitRef, _, _} <- OpenInstances])
+			lists:flatten([bitcask:fold(SplitRef0, Fun, Acc, MaxAge, MaxPut, SeeTombstonesP) || {_, SplitRef0, _, _} <- OpenInstances])
 	end.
 
 %% TODO This is unfinished, need to check for `active` splits to merge.
@@ -647,7 +663,6 @@ transfer_split(KeyDirKey, DiskKey, V, Tstamp, TstampExpire, _FileId, {_, _, _Off
 	Split1State = erlang:get(SplitRef1),
 	OriginWriteFile = Split1State#bc_state.write_file,
 
-	%% TODO Need to add case for `not_found` for keydir get. This happens if a key has been deleted.
 	%% TODO review case clauses are all good and behave as should
 	case bitcask_nifs:keydir_get(State1#mstate.origin_live_keydir, KeyDirKey) of
 		#bitcask_entry{tstamp = OldTstamp, file_id = OldFileId,
@@ -663,7 +678,7 @@ transfer_split(KeyDirKey, DiskKey, V, Tstamp, TstampExpire, _FileId, {_, _, _Off
 					case bitcask_nifs:keydir_remove(State1#mstate.origin_live_keydir,
 						KeyDirKey, OldTstamp,
 						OldFileId, OldOffset) of
-						already_exists ->
+						already_exists ->	%% TODO Will this ever happen on these types of merges? If so what do here?
 							%% Merge updated the keydir after tombstone
 							%% write.  beat us, so undo and retry in a
 							%% new file.
@@ -739,8 +754,6 @@ prep_mstate(Split1, Split2, Dirname1, Dirname2, FilesToMerge, Opts, Ref) ->
 						lists:min([bitcask_fileops:file_tstamp(F) ||
 							F <- ReadableFiles])
 				end,
-
-
 	{ok, DelKeyDir} = bitcask_nifs:keydir_new(),
 
 	#mstate{origin_dirname = Dirname1,
@@ -834,7 +847,6 @@ make_riak_key(<<?VERSION_0:8, _Rest/binary>> = BK) ->
 	binary_to_term(BK);
 make_riak_key(BK) when is_binary(BK) ->
 	BK.
-
 
 check_and_upgrade_key(default, <<Version:7, _Rest/bitstring>> = KeyDirKey) when Version =/= ?VERSION_3 ->
 	KeyDirKey;
@@ -1017,10 +1029,10 @@ manager_special_merge_test() ->
 fold_expired_keys_and_tombstones_test() ->
 	os:cmd("rm -rf /tmp/bc.man.fold"),
 	Dir = "/tmp/bc.man.fold",
-	B = bitcask_manager:open(Dir, [{read_write, true}, {split, default}]),
-	bitcask_manager:open(B, Dir, [{read_write, true}, {split, second}]),
+	ct:pal("################# Fold Keys test"),
 	Keys  = [make_bitcask_key(3, {<<"second">>, <<"second">>}, integer_to_binary(N)) || N <- lists:seq(0,5)],
 	Keys2 = [make_bitcask_key(3, {<<"second">>, <<"second">>}, integer_to_binary(N)) || N <- lists:seq(6,7)],
+	Keys3 = [make_bitcask_key(3, {<<"new_bucket">>, <<"default">>}, integer_to_binary(N)) || N <- lists:seq(8,9)],
 	Expiry = bitcask_time:tstamp() - 1000,
 	PutOpts = [{tstamp_expire, Expiry}],
 	DecodeKeyFun =
@@ -1034,17 +1046,31 @@ fold_expired_keys_and_tombstones_test() ->
 		end,
 	MergeOpts = [{decode_disk_key_fun, DecodeKeyFun}],
 
-	[bitcask_manager:put(B, Key, Key, [{split, second}]) || Key <- Keys],
+	B = bitcask_manager:open(Dir, [{read_write, true}, {split, default} | MergeOpts]),
+	bitcask_manager:open(B, Dir, [{read_write, true}, {split, second} | MergeOpts]),
 
-	[{ok, Key} = bitcask_manager:get(B, Key, [{split, default}]) || Key <- Keys],
-	[{ok, Key} = bitcask_manager:get(B, Key, [{split, second}]) || Key <- Keys],
 
-	FoldFun = fun(_, Key, Acc) -> [Key | Acc] end,
-	FoldKeysFun = fold_keys_fun(FoldFun, <<"second">>),
+	[bitcask_manager:put(B, Key, Key, [{split, second}]) || Key <- Keys ++ Keys3],
+
+	[{ok, Key} = bitcask_manager:get(B, Key, [{split, default}]) || Key <- Keys ++ Keys3],
+	[{ok, Key} = bitcask_manager:get(B, Key, [{split, second}]) || Key <- Keys ++ Keys3],
+
+	FoldKFun = fun(_, Key, Acc) -> [Key | Acc] end,
+	FoldBFun = fun(Bucket, Acc) -> [Bucket | Acc] end,
+	FoldKeysFun = fold_keys_fun(FoldKFun, <<"second">>),
+	FoldBucketsFun = fold_buckets_fun(FoldBFun),
+	FoldObjFun = fold_obj_fun(FoldKFun, undefined),
 
 	ListKeys = bitcask_manager:fold_keys(B, FoldKeysFun, [], [{split, second}]),
+	{ListBuckets, _} = bitcask_manager:fold_keys(B, FoldBucketsFun, {[], sets:new()}),
+	ListObjects = bitcask_manager:fold(B, FoldObjFun, [], []),
+	ct:pal("Returned objects: ~p~n", [ListObjects]),
 	ExpectedKeys = [integer_to_binary(N) || N <- lists:seq(0,5)],
+	ExpectedKeys1 = [integer_to_binary(N) || N <- lists:seq(0,5) ++ lists:seq(8,9), N =/= 1],	%% Remove 1 as the decode fun above matches on it for further in the test
+	ExpectedBuckets = [<<"new_bucket">>, <<"second">>],
 	?assertEqual(ExpectedKeys, lists:sort(ListKeys)),
+	?assertEqual(ExpectedBuckets, lists:sort(ListBuckets)),
+	?assertEqual(ExpectedKeys1, lists:sort(ListObjects)),
 
 	%% Replace value of existing key with one with expiry
 	bitcask_manager:put(B, lists:nth(2, Keys), <<"deadval">>, [{split, second} | PutOpts]),	%% Will expire so not transfer
@@ -1052,8 +1078,11 @@ fold_expired_keys_and_tombstones_test() ->
 	bitcask_manager:put(B, lists:nth(4, Keys), <<"newval">>, [{split, second}]),			%% Updates val no tombstone but only this should transfer
 
 	ListKeys1 = bitcask_manager:fold_keys(B, FoldKeysFun, [], [{split, second}]),
-	ExpectedKeys1 = [integer_to_binary(N) || N <- lists:seq(0,5), N =/= 1 andalso N =/= 2],
-	?assertEqual(ExpectedKeys1, lists:sort(ListKeys1)),
+	ListObjects1 = bitcask_manager:fold(B, FoldObjFun, [], [{split, second}]),
+	ExpectedKeys2 = [integer_to_binary(N) || N <- lists:seq(0,5), N =/= 1 andalso N =/= 2],
+	ExpectedObjects1 = [integer_to_binary(N) || N <- lists:seq(0,5) ++ lists:seq(8,9), N =/= 1 andalso N =/= 2],
+	?assertEqual(ExpectedKeys2, lists:sort(ListKeys1)),
+	?assertEqual(ExpectedObjects1, lists:sort(ListObjects1)),
 
 	bitcask_manager:activate_split(B, second),
 
@@ -1062,20 +1091,84 @@ fold_expired_keys_and_tombstones_test() ->
 	[{ok, Key} = bitcask_manager:get(B, Key, [{split, second}]) || Key <- Keys2],
 
 	ListKeys2 = bitcask_manager:fold_keys(B, FoldKeysFun, [], [{split, second}]),
-	ExpectedKeys2 = [integer_to_binary(N) || N <- lists:seq(0,7), N =/= 1 andalso N =/= 2],
-	?assertEqual(ExpectedKeys2, lists:sort(ListKeys2)),
+	{ListBuckets2, _} = bitcask_manager:fold_keys(B, FoldBucketsFun, {[], sets:new()}),
+	ListObjects2 = bitcask_manager:fold(B, FoldObjFun, [], [{split, second}]),
+	ExpectedKeys3 = [integer_to_binary(N) || N <- lists:seq(0,7), N =/= 1 andalso N =/= 2],
+	ExpectedKeys4 = [integer_to_binary(N) || N <- lists:seq(0,9), N =/= 1 andalso N =/= 2],
+	?assertEqual(ExpectedKeys3, lists:sort(ListKeys2)),
+	?assertEqual(ExpectedBuckets, lists:sort(ListBuckets2)),	%% Splits not yet merged so both buckets should be in default still
+	?assertEqual(ExpectedKeys4, lists:sort(ListObjects2)),
 
 	bitcask_manager:special_merge(B, default, second, MergeOpts),
 
 	%% Check data is same after special merge
 	ListKeys3 = bitcask_manager:fold_keys(B, FoldKeysFun, [], [{split, second}]),
-	?assertEqual(ExpectedKeys2, lists:sort(ListKeys3)),
+	{ListBuckets3, _} = bitcask_manager:fold_keys(B, FoldBucketsFun, {[], sets:new()}),
+	{ListBuckets4, _} = bitcask_manager:fold_keys(B, FoldBucketsFun, {[], sets:new()}, [{all_splits, true}]),
+	ListObjects3 = bitcask_manager:fold(B, FoldObjFun, [], [{split, second}]),
+	?assertEqual(ExpectedKeys3, lists:sort(ListKeys3)),
+	?assertEqual(ExpectedKeys3, lists:sort(ListObjects3)),
+	?assertEqual([<<"new_bucket">>], lists:sort(ListBuckets3)),
+	?assertEqual(ExpectedBuckets, lists:sort(ListBuckets4)),
 
 	bitcask_manager:close(B),
 	ok.
 
 fold_keys_fun(FoldKeysFun, Bucket) ->
 	fun(#bitcask_entry{key=BK}, Acc) ->
+		case make_riak_key(BK) of
+			{_S, B, Key} ->
+				case B =:= Bucket of
+					true ->
+						FoldKeysFun(B, Key, Acc);
+					false ->
+						Acc
+				end;
+			{B, Key} ->
+				case B =:= Bucket of
+					true ->
+						FoldKeysFun(B, Key, Acc);
+					false ->
+						Acc
+				end
+		end
+	end.
+
+fold_buckets_fun(FoldBucketsFun) ->
+	fun(#bitcask_entry{key=BK}, {Acc, BucketSet}) ->
+		case make_riak_key(BK) of
+			{Bucket, _} ->
+				case sets:is_element(Bucket, BucketSet) of
+					true ->
+						{Acc, BucketSet};
+					false ->
+						{FoldBucketsFun(Bucket, Acc),
+							sets:add_element(Bucket, BucketSet)}
+				end;
+			{_S, Bucket, _} ->
+				case sets:is_element(Bucket, BucketSet) of
+					true ->
+						{Acc, BucketSet};
+					false ->
+						{FoldBucketsFun(Bucket, Acc),
+							sets:add_element(Bucket, BucketSet)}
+				end
+		end
+	end.
+
+fold_obj_fun(FoldObjectsFun, undefined) ->
+	fun(BK, _Value, Acc) ->
+		ct:pal("Bucket: ~p Fold obk: ~p~n", [undefined, make_riak_key(BK)]),
+		case make_riak_key(BK) of
+			{_S, Bucket, Key} ->
+				FoldObjectsFun(Bucket, Key, Acc);
+			{Bucket, Key} ->
+				FoldObjectsFun(Bucket, Key, Acc)
+		end
+	end;
+fold_obj_fun(FoldKeysFun, Bucket) ->
+	fun(BK, _Value, Acc) ->
+		ct:pal("Bucket: ~p Fold obk: ~p~n", [Bucket, make_riak_key(BK)]),
 		case make_riak_key(BK) of
 			{_S, B, Key} ->
 				case B =:= Bucket of
