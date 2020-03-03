@@ -126,8 +126,7 @@ needs_merge_wrapper(H) ->
     end.
 
 check_no_tombstones(Ref, Good) ->
-    Res = bitcask:fold_keys(Ref, fun(K, Acc0) -> [K|Acc0] end,
-                            [], -1, -1, true),
+    Res = bitcask:fold_keys(Ref, fun(K, Acc0) -> [K|Acc0] end, []),
     case [X || {tombstone, _} = X <- Res] of
         [] ->
             Good;
@@ -153,14 +152,32 @@ make_merge_txt(Dir, Seed, Probability) ->
     end.
 
 goo({_, _, bc_open, [Dir]}) ->
-    bitcask:open(Dir, [read_write, {max_file_size, ?FILE_SIZE}, {open_timeout, 1234}]);
+    BitcaskOpts =
+        [
+            read_write,
+            {max_file_size, ?FILE_SIZE},
+            {open_timeout, 1234},
+            {max_fold_puts, -1},
+            {max_fold_age, -1},
+            {fold_tombstones, true}
+        ],
+    bitcask:open(Dir, BitcaskOpts);
 goo({_, _, bc_open, [Dir,{DoMergeP,X,Y}]}) ->
     if DoMergeP ->
             make_merge_txt(Dir, X, Y);
        true ->
             ok
     end,
-    bitcask:open(Dir, [read_write, {max_file_size, ?FILE_SIZE}, {open_timeout, 1234}]);
+    BitcaskOpts =
+        [
+            read_write,
+            {max_file_size, ?FILE_SIZE},
+            {open_timeout, 1234},
+            {max_fold_puts, -1},
+            {max_fold_age, -1},
+            {fold_tombstones, true}
+        ],
+    bitcask:open(Dir, BitcaskOpts);
 goo({_, _, bc_close, [H]}) ->
     bitcask:close(H);
 goo({_, _, puts, [H, {K1, K2}, V]}) ->
