@@ -15,6 +15,7 @@
 	open/2,
 	open/3,
 	close/1,
+	close/2,
 	activate_split/2,
 	put/3,
 	put/4,
@@ -150,6 +151,21 @@ close(Ref) ->
 	State = erlang:get(Ref),
 	[bitcask:close(BitcaskRef) || {_, BitcaskRef, _, _} <- State#state.open_instances],
 	ok.
+close(Ref, Split) ->
+	State = erlang:get(Ref),
+	{Split, SplitRef, _, _} = lists:keyfind(Split, 1, State#state.open_instances),
+	{Split, SplitDir} = lists:keyfind(Split, 1, State#state.open_dirs),
+	bitcask:close(SplitRef),
+	NewOpenInstances = lists:keydelete(Split, 1, State#state.open_instances),
+	NewState = State#state{open_instances = NewOpenInstances},
+	erlang:put(Ref, NewState),
+
+	%% Clean up dir location
+	%%TODO Delete split data on disk now it's been closed
+
+	os:cmd("rm -rf " ++ SplitDir), %% TODO Could be replaced with something nicer
+
+	Ref.
 
 activate_split(Ref, Split) ->
 	State = erlang:get(Ref),
