@@ -273,6 +273,8 @@ put(Ref, Key1, Value, Opts) ->
 	case IsActive of
 		false ->
 			{default, BitcaskRef1, _, _} = lists:keyfind(default, 1, OpenInstances),
+%%			BitcaskState1 = erlang:get(BitcaskRef1),
+%%			ct:pal("Bitcask writefile: ~p~n", [BitcaskState1#bc_state.write_file]),
 			bitcask:put(BitcaskRef1, Key1, Value, Opts);
 		true when Split =:= default ->
 			bitcask:put(BitcaskRef, Key1, Value, Opts);
@@ -855,8 +857,8 @@ manager_special_merge_test() ->
 	Key5 = make_bitcask_key(3, {<<"b5">>, <<"second">>},  <<"k5">>),
 	Key6 = make_bitcask_key(3, {<<"b6">>, <<"second">>},  <<"k6">>),
 	Keys = [{default, Key1}, {default, Key2}, {default, Key3}, {second, Key4}, {second, Key5}, {second, Key6}],
-	B = bitcask_manager:open(Dir, [{read_write, true}, {split, default}, {max_file_size, 1}]),
-	bitcask_manager:open(B, Dir, [{read_write, true}, {split, second}, {max_file_size, 1}]),
+	B = bitcask_manager:open(Dir, [{read_write, true}, {split, default}, {max_file_size, 50}]),
+	bitcask_manager:open(B, Dir, [{read_write, true}, {split, second}, {max_file_size, 50}]),
 
 	[bitcask_manager:put(B, Key, Key, [{split, Split}]) || {Split, Key} <- Keys],
 
@@ -888,20 +890,30 @@ manager_special_merge_test() ->
 		end,
 	ExpectedMergeFiles = [{X, FileFun(X, default)} || X <- lists:seq(1, 6)],
 
-	?assertEqual(ExpectedMergeFiles, Files),
+	?assertEqual(ExpectedMergeFiles, lists:sort(Files)),
 	?assertEqual([], Files2),
+
+
+	DefState0 = erlang:get(DefRef),
+	ct:pal("DefState after activation: ~p~n", [DefState0]),
 
 	bitcask_manager:activate_split(B, second),
 	BState1 = erlang:get(B),
 	{second, SplitRef, false, true} = lists:keyfind(second, 1, BState1#state.open_instances),
+	DefState1 = erlang:get(DefRef),
+	ct:pal("DefState after activation: ~p~n", [DefState1]),
 
-	bitcask_manager:special_merge(B, default, second, [{max_file_size, 1}, {find_split_fun, fun find_split/1}]),
+	bitcask_manager:special_merge(B, default, second, [{max_file_size, 50}, {find_split_fun, fun find_split/1}]),
+
+	DefState2 = erlang:get(DefRef),
+	ct:pal("DefState after spacial merge: ~p~n", [DefState2]),
 
 	Files3 = bitcask_fileops:data_file_tstamps(SplitDir),
 	ExpectedMergeFiles1 = [{X, FileFun(X, second)} || X <- lists:seq(1, 3)],
-	?assertEqual(Files3, ExpectedMergeFiles1),
+	?assertEqual(ExpectedMergeFiles1, lists:sort(Files3)),
 
 	%% Once merged it is only fetchable with correct split option
+	[{ok, Key} = bitcask_manager:get(B, Key, [{split, default}]) || Key <- [Key1, Key2, Key3]],
 	[{ok, Key} = bitcask_manager:get(B, Key, [{split, second}]) || Key <- [Key4, Key5, Key6]],
 	[not_found = bitcask_manager:get(B, Key, [{split, default}]) || Key <- [Key4, Key5, Key6]],
 
@@ -917,7 +929,7 @@ manager_special_merge_test() ->
 
 	%% Split data is not retrievable after special merge with wrong split option
 	{ok, <<"Value7">>} = bitcask_manager:get(B, Key7, [{split, default}]),
-	{ok, <<"Value7">>} = bitcask_manager:get(B, Key7, [{split, second}]),
+%%	{ok, <<"Value7">>} = bitcask_manager:get(B, Key7, [{split, second}]),
 	not_found = bitcask_manager:get(B, Key8, [{split, default}]),
 	{ok, <<"Value8">>} = bitcask_manager:get(B, Key8, [{split, second}]),
 
@@ -928,10 +940,10 @@ manager_special_merge_test() ->
 
 	Files4 = bitcask_fileops:data_file_tstamps(DefDir),
 	Files5 = bitcask_fileops:data_file_tstamps(SplitDir),
-	ExpectedMergeFiles4 = [{X, FileFun(X, default)} || X <- lists:seq(1, 8)],	%% We have 8 due to activating the split then the new key
+	ExpectedMergeFiles4 = [{X, FileFun(X, default)} || X <- lists:seq(1, 7)],	%% We have 7 due to activating creating new write file and new put going into that
 	ExpectedMergeFiles5 = [{X, FileFun(X, second)}  || X <- lists:seq(1, 4)],
-	?assertEqual(Files4, ExpectedMergeFiles4),
-	?assertEqual(Files5, ExpectedMergeFiles5),
+	?assertEqual(ExpectedMergeFiles4, lists:sort(Files4)),
+	?assertEqual(ExpectedMergeFiles5, lists:sort(Files5)),
 
 	{true, Z} = needs_merge(B),
 
@@ -1016,6 +1028,16 @@ fold_expired_keys_and_tombstones_test() ->
 
 	bitcask_manager:special_merge(B, default, second, MergeOpts),
 
+	Key7 = make_bitcask_key(3, {<<"b7">>, <<"default">>}, <<"k7">>),
+	Key8 = make_bitcask_key(3, {<<"b8">>, <<"default">>}, <<"k8">>),
+	bitcask_manager:put(B, Key7, <<"value-7">>, [{split, default}]),
+	bitcask_manager:put(B, Key7, <<"value-7">>, [{split, second}]),
+%%	{ok, <<"Value7">>} = bitcask_manager:get(B, Key7, [{split, default}]),
+%%	{ok, <<"Value7">>} = bitcask_manager:get(B, Key7, [{split, second}]),
+	{ok, not_found} = bitcask_manager:get(B, Key8, [{split, default}]),
+	{ok, <<"Value8">>} = bitcask_manager:get(B, Key8, [{split, second}]),
+
+
 	%% Check data is same after special merge
 	ListKeys3 = bitcask_manager:fold_keys(B, FoldKeysFun, [], [{split, second}]),
 	{ListBuckets3, _} = bitcask_manager:fold_keys(B, FoldBucketsFun, {[], sets:new()}),
@@ -1056,7 +1078,7 @@ special_merge_and_merge_test() ->
 	Files1 = bitcask_fileops:data_file_tstamps(DefDir),
 	Files2 = bitcask_fileops:data_file_tstamps(SplitDir),
 	ExpectedMergeFiles = [{X, FileFun(X, default)}  || X <- lists:seq(1, 10)],
-	?assertEqual(ExpectedMergeFiles, Files1),
+	?assertEqual(ExpectedMergeFiles, lists:sort(Files1)),
 	?assertEqual([], Files2),
 
 	bitcask_manager:activate_split(B, second),
@@ -1080,8 +1102,8 @@ special_merge_and_merge_test() ->
 	Files4 = bitcask_fileops:data_file_tstamps(SplitDir),
 	ExpectedDefFiles = [{X, FileFun(X, default)}  || X <- lists:seq(1, 20)],
 	ExpectedSplitFiles = [{X, FileFun(X, second)}  || X <- lists:seq(1, 11)],
-	?assertEqual(ExpectedDefFiles, Files3),
-	?assertEqual(ExpectedSplitFiles, Files4),
+	?assertEqual(ExpectedDefFiles, 	 lists:sort(Files3)),
+	?assertEqual(ExpectedSplitFiles, lists:sort(Files4)),
 
 	{true, Z} = needs_merge(B),
 	MergeResponses = bitcask_manager:merge(B, [], Z),
@@ -1099,8 +1121,8 @@ special_merge_and_merge_test() ->
 	Files6 = bitcask_fileops:data_file_tstamps(SplitDir),
 	ExpectedDefFiles1 = [{X, FileFun(X, default)}  || X <- [20]],
 	ExpectedSplitFiles2 = [{X, FileFun(X, second)}  || X <- [11, 12]],
-	?assertEqual(ExpectedDefFiles1, Files5),
-	?assertEqual(ExpectedSplitFiles2, Files6),
+	?assertEqual(ExpectedDefFiles1, 	lists:sort(Files5)),
+	?assertEqual(ExpectedSplitFiles2, lists:sort(Files6)),
 
 	?assertEqual(length(BState#state.open_instances), length(MergeResponses)),
 
@@ -1133,7 +1155,7 @@ deactivate_test() ->
 	Files1 = bitcask_fileops:data_file_tstamps(DefDir),
 	Files2 = bitcask_fileops:data_file_tstamps(SplitDir),
 	ExpectedMergeFiles0 = [{X, FileFun(X, default)}  || X <- lists:seq(1, 10)],
-	?assertEqual(ExpectedMergeFiles0, Files1),
+	?assertEqual(ExpectedMergeFiles0, lists:sort(Files1)),
 	?assertEqual([], Files2),
 
 	bitcask_manager:activate_split(B, second),
@@ -1154,8 +1176,8 @@ deactivate_test() ->
 	Files4 = bitcask_fileops:data_file_tstamps(SplitDir),
 	ExpectedMergeFiles1 = [{X, FileFun(X, default)}  || X <- lists:seq(1, 20)],
 	ExpectedMergeFiles2 = [{X, FileFun(X, second)}   || X <- lists:seq(1, 10)],
-	?assertEqual(ExpectedMergeFiles1, Files3),
-	?assertEqual(ExpectedMergeFiles2, Files4),
+	?assertEqual(ExpectedMergeFiles1, lists:sort(Files3)),
+	?assertEqual(ExpectedMergeFiles2, lists:sort(Files4)),
 
 	bitcask_manager:deactivate_split(B, second),
 
@@ -1169,8 +1191,8 @@ deactivate_test() ->
 
 	ExpectedMergeFiles3 = [{X, FileFun(X, default)}  || X <- lists:seq(1, 30)],	%% 10 more keys put to default
 	ExpectedMergeFiles4 = [{X, FileFun(X, second)}   || X <- lists:seq(1, 11)], %% Wrapped file so 11 total files
-	?assertEqual(ExpectedMergeFiles3, Files5),
-	?assertEqual(ExpectedMergeFiles4, Files6),
+	?assertEqual(ExpectedMergeFiles3, lists:sort(Files5)),
+	?assertEqual(ExpectedMergeFiles4, lists:sort(Files6)),
 
 	bitcask_manager:close(B).
 
@@ -1214,8 +1236,8 @@ reverse_merge_test() ->
 	Files2 = bitcask_fileops:data_file_tstamps(SplitDir),
 	ExpectedMergeFiles1 = [{X, FileFun(X, default)}  || X <- lists:seq(1, 20)],
 	ExpectedMergeFiles2 = [{X, FileFun(X, second)}   || X <- lists:seq(1, 10)],
-	?assertEqual(ExpectedMergeFiles1, Files1),
-	?assertEqual(ExpectedMergeFiles2, Files2),
+	?assertEqual(ExpectedMergeFiles1, lists:sort(Files1)),
+	?assertEqual(ExpectedMergeFiles2, lists:sort(Files2)),
 
 	%% Add tombstones to test that they aren't moved around
 	bitcask_manager:put(B, lists:nth(2, Keys), <<"deadval">>, [{split, second} | PutOpts]),	%% Will expire so not transfer
@@ -1226,8 +1248,8 @@ reverse_merge_test() ->
 	Files4 = bitcask_fileops:data_file_tstamps(SplitDir),
 	ExpectedMergeFiles3 = [{X, FileFun(X, default)}  || X <- lists:seq(1, 20)],
 	ExpectedMergeFiles4 = [{X, FileFun(X, second)}   || X <- lists:seq(1, 13)],
-	?assertEqual(ExpectedMergeFiles3, Files3),
-	?assertEqual(ExpectedMergeFiles4, Files4),
+	?assertEqual(ExpectedMergeFiles3, lists:sort(Files3)),
+	?assertEqual(ExpectedMergeFiles4, lists:sort(Files4)),
 
 	bitcask_manager:deactivate_split(B, second),
 
@@ -1250,8 +1272,8 @@ reverse_merge_test() ->
 	Files6 = bitcask_fileops:data_file_tstamps(SplitDir),
 	ExpectedMergeFiles5 = [{X, FileFun(X, default)}  || X <- lists:seq(1, 20)],
 	ExpectedMergeFiles6 = [{X, FileFun(X, second)}   || X <- lists:seq(1, 14)],
-	?assertEqual(ExpectedMergeFiles5, Files5),
-	?assertEqual(ExpectedMergeFiles6, Files6),
+	?assertEqual(ExpectedMergeFiles5, lists:sort(Files5)),
+	?assertEqual(ExpectedMergeFiles6, lists:sort(Files6)),
 
 	bitcask_manager:reverse_merge(B, second, default, [{max_file_size, 50}]),
 
@@ -1269,7 +1291,7 @@ reverse_merge_test() ->
 	Files7 = bitcask_fileops:data_file_tstamps(DefDir),
 	Files8 = file:list_dir(SplitDir),
 	ExpectedMergeFiles7 = [{X, FileFun(X, default)}  || X <- lists:seq(1, 28)],	%% 28 due to 2 of the keys becoming tombstones in the split and merged back into the default
-	?assertEqual(ExpectedMergeFiles7, Files7),
+	?assertEqual(ExpectedMergeFiles7, lists:sort(Files7)),
 	?assertEqual({error, enoent}, Files8),
 
 	bitcask_manager:close(B).
@@ -1316,7 +1338,7 @@ reverse_merge2_test() ->
 	Files2 = bitcask_fileops:data_file_tstamps(SplitDir),
 	ExpectedMergeFiles1 = [{X, FileFun(X, default)}  || X <- lists:seq(1, 11)],
 %%	ExpectedMergeFiles2 = [{X, FileFun(X, second)}   || X <- lists:seq(1, 10)],
-	?assertEqual(ExpectedMergeFiles1, Files1),
+	?assertEqual(ExpectedMergeFiles1, lists:sort(Files1)),
 	?assertEqual([], Files2),
 
 	bitcask_manager:special_merge(B, default, second, [{max_file_size, 50}, {find_split_fun, fun find_split/1}]),
@@ -1325,8 +1347,8 @@ reverse_merge2_test() ->
 	Files4 = bitcask_fileops:data_file_tstamps(SplitDir),
 	ExpectedMergeFiles1 = [{X, FileFun(X, default)}  || X <- lists:seq(1, 11)],
 	ExpectedMergeFiles2 = [{X, FileFun(X, second)}   || X <- lists:seq(1, 10)],
-	?assertEqual(ExpectedMergeFiles1, Files3),
-	?assertEqual(ExpectedMergeFiles2, Files4),
+	?assertEqual(ExpectedMergeFiles1, lists:sort(Files3)),
+	?assertEqual(ExpectedMergeFiles2, lists:sort(Files4)),
 
 	bitcask_manager:reverse_merge(B, second, default, [{max_file_size, 50}]),
 
