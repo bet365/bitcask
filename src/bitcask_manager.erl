@@ -353,7 +353,13 @@ fold_keys(Ref, Fun, Acc) ->
 fold_keys(Ref, Fun, Acc, Opts) ->
 	Split = proplists:get_value(split, Opts, default),
 	State = erlang:get(Ref),
-	{Split, SplitRef, _, _} = lists:keyfind(Split, 1, State#state.open_instances),
+	{_Split, SplitRef, _HasMerged, _Active} =
+		case lists:keyfind(Split, 1, State#state.open_instances) of
+			false ->
+				lists:keyfind(default, 1, State#state.open_instances);
+			SplitData ->
+				SplitData
+		end,
 	SplitState = erlang:get(SplitRef),
 
 	MaxAge = bitcask:get_opt(max_fold_age, SplitState#bc_state.opts) * 1000, % convert from ms to us
@@ -365,7 +371,13 @@ fold_keys(Ref, Fun, Acc, Opts, MaxAge, MaxPuts, SeeTombStoneP) ->
 	Split = proplists:get_value(split, Opts, default),
 	State = erlang:get(Ref),
 	OpenInstances = State#state.open_instances,
-	{Split, SplitRef, HasMerged, Active} = lists:keyfind(Split, 1, OpenInstances),
+	{Split1, SplitRef, HasMerged, Active} =
+		case lists:keyfind(Split, 1, State#state.open_instances) of
+			false ->
+				lists:keyfind(default, 1, State#state.open_instances);
+			SplitData ->
+				SplitData
+		end,
 	AllSplits = proplists:get_value(all_splits, Opts, false),
 	case AllSplits of
 		false ->
@@ -373,7 +385,7 @@ fold_keys(Ref, Fun, Acc, Opts, MaxAge, MaxPuts, SeeTombStoneP) ->
 				false ->
 					{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
 					bitcask:fold_keys(DefRef, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP);
-				true when Split =:= default ->
+				true when Split1 =:= default ->
 					{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
 					bitcask:fold_keys(DefRef, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP);
 				true ->
@@ -958,8 +970,6 @@ manager_special_merge_test() ->
 	bitcask_manager:put(B, Key77, <<"Value77">>, [{split, default}]),
 	bitcask_manager:put(B, Key8, <<"Value8">>, [{split, second}]),
 
-	DefState2 = erlang:get(DefRef),
-
 	%% Split data is not retrievable after special merge with wrong split option
 	{ok, <<"Value7">>} = bitcask_manager:get(B, Key7, [{split, default}]),
 	{ok, <<"Value77">>} = bitcask_manager:get(B, Key77, [{split, default}]),
@@ -1333,14 +1343,11 @@ reverse_merge_test() ->
 
 	bitcask_manager:close(B).
 
-%% TODO Need to test deactivating after special merge
-
 reverse_merge2_test() ->
 	os:cmd("rm -rf /tmp/bc.man.reverse_merge2"),
 	Dir = "/tmp/bc.man.reverse_merge2",
 	Keys = [make_bitcask_key(3, {<<"b1">>, <<"second">>}, integer_to_binary(N)) || N <- lists:seq(1,10)],
 	Expiry = bitcask_time:tstamp() - 1000,
-%%	PutOpts = [{tstamp_expire, Expiry}],
 	DecodeKeyFun = decode_key_fun(Keys, Expiry),
 	MergeOpts = [{decode_disk_key_fun, DecodeKeyFun}],
 	B = bitcask_manager:open(Dir, [{read_write, true}, {split, default}, {max_file_size, 50} | MergeOpts]),
@@ -1357,8 +1364,6 @@ reverse_merge2_test() ->
 
 	bitcask_manager:activate_split(B, second),
 
-%%	[bitcask_manager:put(B, Key, <<"new_val">>, [{split, second}]) || Key <- Keys],
-
 	DefDir = lists:concat([Dir, "/", default]),
 	SplitDir = lists:concat([Dir, "/", second]),
 	BState0 = erlang:get(B),
@@ -1373,12 +1378,12 @@ reverse_merge2_test() ->
 	Files1 = bitcask_fileops:data_file_tstamps(DefDir),
 	Files2 = bitcask_fileops:data_file_tstamps(SplitDir),
 	ExpectedMergeFiles1 = [{X, FileFun(X, default)}  || X <- lists:seq(1, 11)],
-%%	ExpectedMergeFiles2 = [{X, FileFun(X, second)}   || X <- lists:seq(1, 10)],
 	?assertEqual(ExpectedMergeFiles1, lists:sort(Files1)),
 	?assertEqual([], Files2),
 
 	bitcask_manager:special_merge(B, default, second, [{max_file_size, 50}, {find_split_fun, fun find_split/1}]),
 
+	%% Confirm Data has been moved to new location and is retrievable
 	DefState1 = erlang:get(DefRef),
 	SplitState1 = erlang:get(SplitRef),
 	[not_found = bitcask_manager:get(B, Key, [{split, default}]) || Key <- Keys],
@@ -1386,6 +1391,7 @@ reverse_merge2_test() ->
 	[not_found = bitcask_nifs:keydir_get(DefState1#bc_state.keydir, Key) || Key <- Keys],
 	[#bitcask_entry{} = bitcask_nifs:keydir_get(SplitState1#bc_state.keydir, Key) || Key <- Keys],
 
+	%% Confirm tombstones get writen to file in default location and data is also transferred
 	Files3 = bitcask_fileops:data_file_tstamps(DefDir),
 	Files4 = bitcask_fileops:data_file_tstamps(SplitDir),
 	ExpectedMergeFiles2 = [{X, FileFun(X, default)}  || X <- lists:seq(1, 20)],
@@ -1393,7 +1399,7 @@ reverse_merge2_test() ->
 	?assertEqual(ExpectedMergeFiles2, lists:sort(Files3)),
 	?assertEqual(ExpectedMergeFiles3, lists:sort(Files4)),
 
-	bitcask_manager:reverse_merge(B, second, default, [{max_file_size, 50}]),	%% TODO Possible check in funct to ensure split origin has been deactivated?
+	bitcask_manager:reverse_merge(B, second, default, [{max_file_size, 50}]),
 
 	DefState2 = erlang:get(DefRef),
 	SplitState2 = erlang:get(SplitRef),
