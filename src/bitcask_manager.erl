@@ -37,13 +37,11 @@
 	reverse_merge/4,
 	needs_merge/1,
 	needs_merge/2,
-%%	check_and_upgrade_key/2,
 	check_backend_exists/2,
 	is_active/2,
 	has_merged/2,
 	is_empty_estimate/1,
-	status/1,
-	make_riak_key/1
+	status/1
 ]).
 
 -include("bitcask.hrl").
@@ -52,8 +50,6 @@
 -define(VERSION_1, 1).
 -define(VERSION_2, 2).
 -define(VERSION_3, 3).
-
-%%-define(CHECK_AND_UPGRADE_KEY, fun check_and_upgrade_key/2).
 
 -ifdef(namespaced_types).
 -type bitcask_set() :: sets:set().
@@ -81,6 +77,8 @@
 	expiry_grace_time :: integer(),
 	decode_disk_key_fun :: function(),
 	find_split_fun :: function(),
+	upgrade_key_fun :: function(),
+	upgrade_key :: boolean(),
 	read_write_p :: integer(),    % integer() avoids atom -> NIF
 	opts :: list(),
 	delete_files :: [#filestate{}],
@@ -263,6 +261,7 @@ get2(Key1, Split, SplitRef, DefState, DefRef) ->
 			end
 	end.
 
+%% TODO Potentially check and upgrade keys when putting if the split is active
 put(Ref, Key, Value) ->
 	put(Ref, Key, Value, []).
 put(Ref, Key1, Value, Opts) ->
@@ -620,7 +619,16 @@ merge_single_entry(KeyDirKey, DiskKey, V, Tstamp, TstampExpire, FileId, {_, _, O
 			State
 	end.
 
-transfer_split(KeyDirKey, DiskKey, V, Tstamp, TstampExpire, _FileId, {_, _, _Offset, _} = _Pos, State) ->
+transfer_split(KeyDirKey, DiskKey, V, Tstamp, TstampExpire, _FileId, {_, _, _Offset, _} = _Pos, #mstate{destination_splitname = DestinationSplit, upgrade_key_fun = UpgradeKeyFun, upgrade_key = UpgradeKey} = State) ->
+	{KeyDirKey1, _DiskKey1} = case UpgradeKey of
+		false ->
+			{KeyDirKey, DiskKey};
+		true ->
+			NewKeyDirKey = UpgradeKeyFun(DestinationSplit, KeyDirKey),
+			NewDiskKey 	 = UpgradeKeyFun(DestinationSplit, DiskKey),
+			{NewKeyDirKey, NewDiskKey}
+	end,
+
 	State1 =
 		case bitcask_fileops:check_write(State#mstate.out_file,
 			DiskKey, size(V),
@@ -662,7 +670,7 @@ transfer_split(KeyDirKey, DiskKey, V, Tstamp, TstampExpire, _FileId, {_, _, _Off
 	OutFileId = bitcask_fileops:file_tstamp(Outfile),
 
 	Outfile2 =
-		case bitcask_nifs:keydir_put(State1#mstate.destination_live_keydir, KeyDirKey,
+		case bitcask_nifs:keydir_put(State1#mstate.destination_live_keydir, KeyDirKey1,
 			OutFileId,
 			Size, Offset, Tstamp, TstampExpire,
 			bitcask_time:tstamp(),
@@ -740,7 +748,9 @@ transfer_split(KeyDirKey, DiskKey, V, Tstamp, TstampExpire, _FileId, {_, _, _Off
 prep_mstate(Split1, Split2, Dirname1, Dirname2, FilesToMerge, Opts, Ref) ->
 
 	DecodeDiskKeyFun = bitcask:get_decode_disk_key_fun(bitcask:get_opt(decode_disk_key_fun, Opts)),
-	FindSplitFun = bitcask:get_decode_disk_key_fun(bitcask:get_opt(find_split_fun, Opts)),
+	FindSplitFun = bitcask:get_find_split_fun(bitcask:get_opt(find_split_fun, Opts)),
+	UpgradeKeyFun = bitcask:get_upgrade_key_fun(bitcask:get_opt(upgrade_key_fun, Opts)),
+	UpgradeKey = proplists:get_value(upgrade_key, Opts, false),
 
 	case bitcask_lockops:acquire(merge, Dirname2) of
 		{ok, Lock} ->
@@ -814,6 +824,8 @@ prep_mstate(Split1, Split2, Dirname1, Dirname2, FilesToMerge, Opts, Ref) ->
 		expiry_grace_time = bitcask:expiry_grace_time(Opts),
 		decode_disk_key_fun = DecodeDiskKeyFun,
 		find_split_fun = FindSplitFun,
+		upgrade_key_fun = UpgradeKeyFun,
+		upgrade_key = UpgradeKey,
 		read_write_p = 0,
 		opts = Opts,
 		delete_files = []}.
@@ -822,21 +834,6 @@ prep_mstate(Split1, Split2, Dirname1, Dirname2, FilesToMerge, Opts, Ref) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
-
-%%check_and_upgrade_key(default, <<Version:7, _Rest/bitstring>> = KeyDirKey) when Version =/= ?VERSION_3 ->
-%%	KeyDirKey;
-%%check_and_upgrade_key(Split, <<Version:7, _Rest/bitstring>> = KeyDirKey) when Version =/= ?VERSION_3 ->
-%%	case ?DECODE_BITCASK_KEY(KeyDirKey) of
-%%		{{Bucket, Type}, Key} ->
-%%			?ENCODE_BITCASK_KEY(3, {Type, Bucket, atom_to_binary(Split, latin1)}, Key);
-%%		{Bucket, Key} ->
-%%			NewKey = ?ENCODE_BITCASK_KEY(3, {Bucket, atom_to_binary(Split, latin1)}, Key),
-%%			NewKey
-%%	end;
-%%check_and_upgrade_key(_Split, <<?VERSION_3:7, _Rest/bitstring>> = KeyDirKey) ->
-%%	KeyDirKey;
-%%check_and_upgrade_key(_Split, KeyDirKey) ->
-%%	KeyDirKey.
 
 check_backend_exists(Ref, Key) ->
 	State = erlang:get(Ref),
@@ -876,20 +873,6 @@ status(Ref) ->
 	{default, BRef, _, _} = lists:keyfind(default, 1, State#state.open_instances),
 	[bitcask:status(BRef)].
 %%	[bitcask:status(erlang:get(BRef)) || {_, BRef, _, _} <- OpenInstances].
-
-make_riak_key(<<?VERSION_3:7, HasType:1, SplitSz:16/integer, Split:SplitSz/bytes, Sz:16/integer,
-	TypeOrBucket:Sz/bytes, Rest/binary>>) ->
-	case HasType of
-		0 ->
-			%% no type, first field is bucket
-			{Split, TypeOrBucket, Rest};
-		1 ->
-			%% has a tyoe, extract bucket as well
-			<<BucketSz:16/integer, Bucket:BucketSz/bytes, Key/binary>> = Rest,
-			{Split, {TypeOrBucket, Bucket}, Key}
-	end;
-make_riak_key(BK) when is_binary(BK) ->
-	BK.
 
 %% ===================================================================
 %% EUnit tests
@@ -944,7 +927,7 @@ manager_special_merge_test() ->
 
 	bitcask_manager:activate_split(B, second),
 
-	bitcask_manager:special_merge(B, default, second, [{max_file_size, 60}, {find_split_fun, fun find_split/1}]),
+	bitcask_manager:special_merge(B, default, second, [{max_file_size, 60}, {find_split_fun, fun find_split/1}, {upgrade_key, true}, {upgrade_key_fun, fun check_and_upgrade_key/2}]),
 
 	Files3 = bitcask_fileops:data_file_tstamps(DefDir),
 	Files4 = bitcask_fileops:data_file_tstamps(SplitDir),
@@ -1017,7 +1000,7 @@ fold_expired_keys_and_tombstones_test() ->
 	Expiry = bitcask_time:tstamp() - 1000,
 	PutOpts = [{tstamp_expire, Expiry}],
 	DecodeKeyFun = decode_key_fun(Keys, Expiry),
-	MergeOpts = [{decode_disk_key_fun, DecodeKeyFun}, {find_split_fun, fun find_split/1}],
+	MergeOpts = [{decode_disk_key_fun, DecodeKeyFun}, {find_split_fun, fun find_split/1}, {upgrade_key, true}, {upgrade_key_fun, fun check_and_upgrade_key/2}],
 
 	B = bitcask_manager:open(Dir, [{read_write, true}, {split, default} | MergeOpts]),
 	bitcask_manager:open(B, Dir, [{read_write, true}, {split, second} | MergeOpts]),
@@ -1138,7 +1121,14 @@ special_merge_and_merge_test() ->
 	[not_found = bitcask_nifs:keydir_get(DefState0#bc_state.keydir, Key) || Key <- Keys],
 	[#bitcask_entry{} = bitcask_nifs:keydir_get(SplitState0#bc_state.keydir, Key) || Key <- Keys],
 
-	bitcask_manager:special_merge(B, default, second, [{max_file_size, 50}, {find_split_fun, fun find_split/1}]),
+	bitcask_manager:special_merge(B, default, second, [{max_file_size, 50}, {find_split_fun, fun find_split/1}, {upgrade_key, true}, {upgrade_key_fun, fun check_and_upgrade_key/2}]),
+
+	DefState00 = erlang:get(DefRef),
+	SplitState00 = erlang:get(SplitRef),
+	[not_found = bitcask_manager:get(B, Key, [{split, default}]) || Key <- Keys],
+	[{ok, <<"new_val">>} = bitcask_manager:get(B, Key, [{split, second}]) || Key <- Keys],
+	[not_found = bitcask_nifs:keydir_get(DefState00#bc_state.keydir, Key) || Key <- Keys],
+	[#bitcask_entry{} = bitcask_nifs:keydir_get(SplitState00#bc_state.keydir, Key) || Key <- Keys],
 
 	%% Create tombstone values of keys 2 and 3 so these files get merged
 	[bitcask_manager:put(B, Key, <<"newer_val">>, [{split, second}]) || Key <- [lists:nth(2, Keys)]],
@@ -1319,7 +1309,7 @@ reverse_merge_test() ->
 	?assertEqual(ExpectedMergeFiles5, lists:sort(Files5)),
 	?assertEqual(ExpectedMergeFiles6, lists:sort(Files6)),
 
-	bitcask_manager:reverse_merge(B, second, default, [{max_file_size, 50}]),
+	bitcask_manager:reverse_merge(B, second, default, [{max_file_size, 50}, {upgrade_key, true}, {upgrade_key_fun, fun check_and_upgrade_key/2}]),
 
 	BState2 = erlang:get(B),
 	DefState2 = erlang:get(DefRef),
@@ -1381,7 +1371,7 @@ reverse_merge2_test() ->
 	?assertEqual(ExpectedMergeFiles1, lists:sort(Files1)),
 	?assertEqual([], Files2),
 
-	bitcask_manager:special_merge(B, default, second, [{max_file_size, 50}, {find_split_fun, fun find_split/1}]),
+	bitcask_manager:special_merge(B, default, second, [{max_file_size, 50}, {find_split_fun, fun find_split/1}, {upgrade_key, true}, {upgrade_key_fun, fun check_and_upgrade_key/2}]),
 
 	%% Confirm Data has been moved to new location and is retrievable
 	DefState1 = erlang:get(DefRef),
@@ -1399,7 +1389,7 @@ reverse_merge2_test() ->
 	?assertEqual(ExpectedMergeFiles2, lists:sort(Files3)),
 	?assertEqual(ExpectedMergeFiles3, lists:sort(Files4)),
 
-	bitcask_manager:reverse_merge(B, second, default, [{max_file_size, 50}]),
+	bitcask_manager:reverse_merge(B, second, default, [{max_file_size, 50}, {upgrade_key, true}, {upgrade_key_fun, fun check_and_upgrade_key/2}]),
 
 	DefState2 = erlang:get(DefRef),
 	SplitState2 = erlang:get(SplitRef),
@@ -1422,7 +1412,55 @@ reverse_merge2_test() ->
 	_Files6 = bitcask_fileops:data_file_tstamps(DefDir),
 	bitcask_manager:close(B).
 
+upgrade_keys_test() ->
+	os:cmd("rm -rf /tmp/bc.man.upgrade_keys"),
+	Dir = "/tmp/bc.man.upgrade_keys",
+	Keys = [make_bitcask_key(2, <<"second">>, integer_to_binary(N)) || N <- lists:seq(0,5)],	%% Old Key Type no split
+	Keys1 = [make_bitcask_key(3, {<<"second">>, <<"second">>}, integer_to_binary(N)) || N <- lists:seq(0,5)],	%% New Version of above keys
+	Keys2 = [make_bitcask_key(3, {<<"second">>, <<"second">>}, integer_to_binary(N)) || N <- lists:seq(6,9)],	%% New Keys with split
 
+	B = bitcask_manager:open(Dir, [{read_write, true}, {split, default}, {max_file_size, 50}]),
+	bitcask_manager:open(B, Dir, [{read_write, true}, {split, second}, {max_file_size, 50}]),
+	BState = erlang:get(B),
+	{default, DefRef, _, _} = lists:keyfind(default, 1, BState#state.open_instances),
+	{second, SplitRef, _, _} = lists:keyfind(second, 1, BState#state.open_instances),
+	DefState0 = erlang:get(DefRef),
+	SplitState0 = erlang:get(SplitRef),
+	FoldKFun = fun(_, Key, Acc) -> [Key | Acc] end,
+	FoldKeysFun = fold_keys_fun(FoldKFun, <<"second">>),
+
+	[bitcask_manager:put(B, Key, Key, [{split, second}]) || Key <- Keys ++ Keys2],
+
+	%% Check versions of keys in keydir are correct
+	BKeys0 = [#bitcask_entry{} = bitcask_nifs:keydir_get(DefState0#bc_state.keydir, Key) || Key <- Keys],
+	BKeys1 = [#bitcask_entry{} = bitcask_nifs:keydir_get(DefState0#bc_state.keydir, Key) || Key <- Keys2],
+	[not_found = bitcask_nifs:keydir_get(SplitState0#bc_state.keydir, Key) || Key <- Keys ++ Keys2],
+
+	[?assertEqual(2, Version) || #bitcask_entry{key = <<Version:7, _Rest/binary>>} <- BKeys0],
+	[?assertEqual(3, Version) || #bitcask_entry{key = <<Version:7, _Rest/binary>>} <- BKeys1],
+
+	ListKeys = bitcask_manager:fold_keys(B, FoldKeysFun, [], [{split, second}]),
+
+	ExpectedKeys = [integer_to_binary(N) || N <- lists:seq(0,9)],
+	?assertEqual(ExpectedKeys, lists:sort(ListKeys)),
+
+	bitcask_manager:activate_split(B, second),
+
+	bitcask_manager:special_merge(B, default, second, [{max_file_size, 50}, {find_split_fun, fun find_split/1}, {upgrade_key, true}, {upgrade_key_fun, fun check_and_upgrade_key/2}]),
+
+	ListKeys1 = bitcask_manager:fold_keys(B, FoldKeysFun, [], [{split, second}]),
+
+	DefState1 = erlang:get(DefRef),
+	SplitState1 = erlang:get(SplitRef),
+	[not_found = bitcask_nifs:keydir_get(DefState1#bc_state.keydir, Key) || Key <- Keys ++ Keys1 ++ Keys2],
+	[not_found = bitcask_nifs:keydir_get(SplitState1#bc_state.keydir, Key) || Key <- Keys], %% key now been updated so old ones not found in keydir
+	BKeys2 = [#bitcask_entry{} = bitcask_nifs:keydir_get(SplitState1#bc_state.keydir, Key) || Key <- Keys1],
+	BKeys3 = [#bitcask_entry{} = bitcask_nifs:keydir_get(SplitState1#bc_state.keydir, Key) || Key <- Keys2],
+	[?assertEqual(3, Version) || #bitcask_entry{key = <<Version:7, _Rest/binary>>} <- BKeys2],
+	[?assertEqual(3, Version) || #bitcask_entry{key = <<Version:7, _Rest/binary>>} <- BKeys3],
+	?assertEqual(ExpectedKeys, lists:sort(ListKeys1)),
+
+	bitcask_manager:close(B).
 
 decode_key_fun(Keys, Expiry) ->
 	fun(Key) ->
@@ -1531,43 +1569,43 @@ make_bitcask_key(3, {Bucket, Split}, Key) ->
 	BucketSz = size(Bucket),
 	<<?VERSION_3:7, 0:1, SplitSz:16/integer, Split/binary, BucketSz:16/integer, Bucket/binary, Key/binary>>.
 
-%%make_riak_key(<<?VERSION_3:7, HasType:1, SplitSz:16/integer, Split:SplitSz/bytes, Sz:16/integer,
-%%	TypeOrBucket:Sz/bytes, Rest/binary>>) ->
-%%	case HasType of
-%%		0 ->
-%%			%% no type, first field is bucket
-%%			{Split, TypeOrBucket, Rest};
-%%		1 ->
-%%			%% has a tyoe, extract bucket as well
-%%			<<BucketSz:16/integer, Bucket:BucketSz/bytes, Key/binary>> = Rest,
-%%			{Split, {TypeOrBucket, Bucket}, Key}
-%%	end;
-%%make_riak_key(<<?VERSION_2:7, HasType:1, Sz:16/integer,
-%%	TypeOrBucket:Sz/bytes, Rest/binary>>) ->
-%%	case HasType of
-%%		0 ->
-%%			%% no type, first field is bucket
-%%			{TypeOrBucket, Rest};
-%%		1 ->
-%%			%% has a tyoe, extract bucket as well
-%%			<<BucketSz:16/integer, Bucket:BucketSz/bytes, Key/binary>> = Rest,
-%%			{{TypeOrBucket, Bucket}, Key}
-%%	end;
-%%make_riak_key(<<?VERSION_1:7, HasType:1, Sz:16/integer,
-%%	TypeOrBucket:Sz/bytes, Rest/binary>>) ->
-%%	case HasType of
-%%		0 ->
-%%			%% no type, first field is bucket
-%%			{TypeOrBucket, Rest};
-%%		1 ->
-%%			%% has a tyoe, extract bucket as well
-%%			<<BucketSz:16/integer, Bucket:BucketSz/bytes, Key/binary>> = Rest,
-%%			{{TypeOrBucket, Bucket}, Key}
-%%	end;
-%%make_riak_key(<<?VERSION_0:8, _Rest/binary>> = BK) ->
-%%	binary_to_term(BK);
-%%make_riak_key(BK) when is_binary(BK) ->
-%%	BK.
+make_riak_key(<<?VERSION_3:7, HasType:1, SplitSz:16/integer, Split:SplitSz/bytes, Sz:16/integer,
+	TypeOrBucket:Sz/bytes, Rest/binary>>) ->
+	case HasType of
+		0 ->
+			%% no type, first field is bucket
+			{Split, TypeOrBucket, Rest};
+		1 ->
+			%% has a tyoe, extract bucket as well
+			<<BucketSz:16/integer, Bucket:BucketSz/bytes, Key/binary>> = Rest,
+			{Split, {TypeOrBucket, Bucket}, Key}
+	end;
+make_riak_key(<<?VERSION_2:7, HasType:1, Sz:16/integer,
+	TypeOrBucket:Sz/bytes, Rest/binary>>) ->
+	case HasType of
+		0 ->
+			%% no type, first field is bucket
+			{TypeOrBucket, Rest};
+		1 ->
+			%% has a tyoe, extract bucket as well
+			<<BucketSz:16/integer, Bucket:BucketSz/bytes, Key/binary>> = Rest,
+			{{TypeOrBucket, Bucket}, Key}
+	end;
+make_riak_key(<<?VERSION_1:7, HasType:1, Sz:16/integer,
+	TypeOrBucket:Sz/bytes, Rest/binary>>) ->
+	case HasType of
+		0 ->
+			%% no type, first field is bucket
+			{TypeOrBucket, Rest};
+		1 ->
+			%% has a tyoe, extract bucket as well
+			<<BucketSz:16/integer, Bucket:BucketSz/bytes, Key/binary>> = Rest,
+			{{TypeOrBucket, Bucket}, Key}
+	end;
+make_riak_key(<<?VERSION_0:8, _Rest/binary>> = BK) ->
+	binary_to_term(BK);
+make_riak_key(BK) when is_binary(BK) ->
+	BK.
 
 find_split(Key) ->
 	case make_riak_key(Key) of
@@ -1582,5 +1620,20 @@ find_split(Key) ->
 		_ ->
 			default
 	end.
+
+check_and_upgrade_key(default, <<Version:7, _Rest/bitstring>> = KeyDirKey) when Version =/= ?VERSION_3 ->
+	KeyDirKey;
+check_and_upgrade_key(Split, <<Version:7, _Rest/bitstring>> = KeyDirKey) when Version =/= ?VERSION_3 ->
+	case make_riak_key(KeyDirKey) of
+		{{Bucket, Type}, Key} ->
+			make_bitcask_key(3, {Type, Bucket, atom_to_binary(Split, latin1)}, Key);
+		{Bucket, Key} ->
+			NewKey = make_bitcask_key(3, {Bucket, atom_to_binary(Split, latin1)}, Key),
+			NewKey
+	end;
+check_and_upgrade_key(_Split, <<?VERSION_3:7, _Rest/bitstring>> = KeyDirKey) ->
+	KeyDirKey;
+check_and_upgrade_key(_Split, KeyDirKey) ->
+	KeyDirKey.
 
 	-endif.

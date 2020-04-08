@@ -47,6 +47,8 @@
          wrap_write_file/1,
          check_get/5,
          get_decode_disk_key_fun/1,
+         get_find_split_fun/1,
+         get_upgrade_key_fun/1,
          readable_files/1,
          expiry_time/1,
          expiry_grace_time/1,
@@ -2133,6 +2135,22 @@ default_decode_disk_key_fun(Key) ->
     #keyinfo{key = Key}.
 
 
+get_find_split_fun(Fun) when is_function(Fun) ->
+  Fun;
+get_find_split_fun(_) ->
+  fun default_find_split_fun/1.
+
+default_find_split_fun(Key) ->
+  Key.
+
+
+get_upgrade_key_fun(Fun) when is_function(Fun) ->
+  Fun;
+get_upgrade_key_fun(_) ->
+  fun default_upgrade_key_fun/2.
+
+default_upgrade_key_fun(_Split, Key) ->
+  Key.
 
 
 is_key_expired(?DEFAULT_TSTAMP_EXPIRE) -> false;
