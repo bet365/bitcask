@@ -53,7 +53,8 @@
          expiry_time/1,
          expiry_grace_time/1,
          is_key_expired/1,
-         out_of_date/9
+         out_of_date/9,
+         tombstone_size_for_version/1
     ]).
 -export([has_pending_delete_bit/1]).                    % For EUnit tests
 
