@@ -184,7 +184,9 @@ activate_split(Ref, Split) ->
 					NewState = State#state{open_instances = [{Split, SplitRef, HasMerged, true} | OpenInstances]},
 					erlang:put(Ref, NewState),
 					Ref
-			end
+			end;
+		_ ->
+			{error, wrong_state}
 	end.
 
 deactivate_split(Ref, Split) ->
@@ -196,8 +198,6 @@ deactivate_split(Ref, Split) ->
 			error_cannot_deactivate;
 		{Split, SplitRef, HasMerged, IsActive} ->
 			case IsActive of
-				false ->
-					Ref;
 				true ->
 					SplitState = erlang:get(SplitRef),
 					case SplitState#bc_state.write_file of
@@ -219,7 +219,9 @@ deactivate_split(Ref, Split) ->
 							erlang:put(Ref, NewState),
 							Ref
 					end
-			end
+			end;
+		_ ->
+			Ref
 	end.
 
 get(Ref, Key1, Opts) ->
@@ -275,9 +277,6 @@ put(Ref, Key1, Value, Opts) ->
 	%% If it is ready then perform a get of the object from the default location and delete it from there
 	%% if it exists.
 	case IsActive of
-		false ->
-			{default, BitcaskRef1, _, _} = lists:keyfind(default, 1, OpenInstances),
-			bitcask:put(BitcaskRef1, Key1, Value, Opts);
 		true when Split =:= default ->
 			bitcask:put(BitcaskRef, Key1, Value, Opts);
 		true ->
@@ -299,7 +298,10 @@ put(Ref, Key1, Value, Opts) ->
 									error_could_not_put
 							end
 					end
-			end
+			end;
+		_ ->
+			{default, BitcaskRef1, _, _} = lists:keyfind(default, 1, OpenInstances),
+			bitcask:put(BitcaskRef1, Key1, Value, Opts)
 	end.
 
 delete(Ref, Key) ->
@@ -312,9 +314,6 @@ delete(Ref, Key, Opts) ->
 	{Split, SplitRef, _, Active} = lists:keyfind(Split, 1, OpenInstances),
 
 	case Active of
-		false ->
-			{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
-			bitcask:delete(DefRef, Key, Opts);
 		true when Split =:= default ->
 			bitcask:delete(SplitRef, Key, Opts);
 		true ->
@@ -325,7 +324,10 @@ delete(Ref, Key, Opts) ->
 					bitcask:delete(SplitRef, Key, Opts);
 				_ ->
 					error_could_not_delete_data_still_exists_in_default_split %% Here we could just delete from both?
-			end
+			end;
+		false ->
+			{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
+			bitcask:delete(DefRef, Key, Opts)
 	end.
 
 sync(Ref) ->
@@ -381,9 +383,6 @@ fold_keys(Ref, Fun, Acc, Opts, MaxAge, MaxPuts, SeeTombStoneP) ->
 	case AllSplits of
 		false ->
 			case Active of
-				false ->
-					{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
-					bitcask:fold_keys(DefRef, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP);
 				true when Split1 =:= default ->
 					{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
 					bitcask:fold_keys(DefRef, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP);
@@ -396,7 +395,11 @@ fold_keys(Ref, Fun, Acc, Opts, MaxAge, MaxPuts, SeeTombStoneP) ->
 							lists:flatten([DefKeys, SplitKeys]);
 						true ->
 							bitcask:fold_keys(SplitRef, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP)
-					end
+					end;
+				_ ->
+					ct:pal("Are we folding in default location?"),
+					{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
+					bitcask:fold_keys(DefRef, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP)
 			end;
 		true ->
 			case [bitcask:fold_keys(SplitRef0, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP) || {_Split0, SplitRef0, _, SplitActive} <- OpenInstances, SplitActive =:= true] of
@@ -432,9 +435,6 @@ fold(Ref, Fun, Acc, Opts, MaxAge, MaxPut, SeeTombstonesP) ->
 	case AllSplits of
 		false ->
 			case Active of
-				false ->
-					{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
-					bitcask:fold(DefRef, Fun, Acc, MaxAge, MaxPut, SeeTombstonesP);
 				true when Split =:= default ->
 					{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
 					bitcask:fold(DefRef, Fun, Acc, MaxAge, MaxPut, SeeTombstonesP);
@@ -447,7 +447,10 @@ fold(Ref, Fun, Acc, Opts, MaxAge, MaxPut, SeeTombstonesP) ->
 							lists:flatten([DefKeys, SplitKeys]);
 						true ->
 							bitcask:fold(SplitRef, Fun, Acc, MaxAge, MaxPut, SeeTombstonesP)
-					end
+					end;
+				_ ->
+					{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
+					bitcask:fold(DefRef, Fun, Acc, MaxAge, MaxPut, SeeTombstonesP)
 			end;
 		true ->
 			lists:flatten([bitcask:fold(SplitRef0, Fun, Acc, MaxAge, MaxPut, SeeTombstonesP) || {_, SplitRef0, _, _} <- OpenInstances])
@@ -468,20 +471,24 @@ merge(_RootDir, Opts, FilesToMerge) ->
 
 special_merge(Ref, Split1, Split2, Opts) ->
 	State = erlang:get(Ref),
-	{Split1, _SplitRef1, _HasMerged1, _IsActive1} = lists:keyfind(Split1, 1, State#state.open_instances),
+	{Split1, _SplitRef1, _HasMerged1, IsActive1} = lists:keyfind(Split1, 1, State#state.open_instances),
 	{Split2, SplitRef2, _HasMerged2, IsActive2} = lists:keyfind(Split2, 1, State#state.open_instances),
 
-	ok = special_merge2(Ref, Split1, Split2, Opts),
+	case eliminate of
+		X when X =:= IsActive1 andalso X =:= IsActive2 ->
+			error;
+		_ ->
+			ok = special_merge2(Ref, Split1, Split2, Opts),
 
-	OpenInstances = lists:keyreplace(Split2, 1, State#state.open_instances, {Split2, SplitRef2, true, IsActive2}),
-	NewState1 = State#state{open_instances = OpenInstances},
-	erlang:put(Ref, NewState1),
-	ok.
+			OpenInstances = lists:keyreplace(Split2, 1, State#state.open_instances, {Split2, SplitRef2, true, IsActive2}),
+			NewState1 = State#state{open_instances = OpenInstances},
+			erlang:put(Ref, NewState1),
+			ok
+	end.
 
 reverse_merge(Ref, Split1, Split2, Opts) ->
 	State = erlang:get(Ref),
 	{Split1, SplitRef1, _HasMerged1, _IsActive1} = lists:keyfind(Split1, 1, State#state.open_instances),
-%%	{Split1, SplitDir} = lists:keyfind(Split1, 1, State#state.open_dirs),
 	{Split2, _SplitRef2, _HasMerged2, _IsActive2} = lists:keyfind(Split2, 1, State#state.open_instances),
 
 	ok = special_merge2(Ref, Split1, Split2, [{reverse_merge, true} | Opts]),
@@ -497,27 +504,28 @@ special_merge2(Ref, Split1, Split2, Opts) ->
 	{Split2, _SplitRef2, HasMerged2, IsActive2} = lists:keyfind(Split2, 1, State#state.open_instances),
 
 	MState = case IsActive2 of
-				 false ->
-					 io:format("Cannot merge split: ~p due to not being active for merging", [Split1]);
-				 true ->
-					 case HasMerged2 of
-						 true when Split2 =/= default ->
-							 io:format("This Split has already been merged: ~p~n", [Split2]);
-						 true when Split2 =:= default ->
-							 Dirname1 = proplists:get_value(Split1, State#state.open_dirs),
-							 Dirname2 = proplists:get_value(Split2, State#state.open_dirs),
-							 FilesToMerge = bitcask:readable_files(Dirname1),
-							 NewState = prep_mstate(Split1, Split2, Dirname1, Dirname2, FilesToMerge, Opts, Ref),
-							 merge_files(NewState);
-						 false ->
-							 Dirname1 = proplists:get_value(Split1, State#state.open_dirs),
-							 Dirname2 = proplists:get_value(Split2, State#state.open_dirs),
-							 FilesToMerge = bitcask:readable_files(Dirname1),
+						 true ->
+							 case HasMerged2 of
+								 true when Split2 =/= default ->
+									 io:format("This Split has already been merged: ~p~n", [Split2]);
+								 true when Split2 =:= default ->
+									 Dirname1 = proplists:get_value(Split1, State#state.open_dirs),
+									 Dirname2 = proplists:get_value(Split2, State#state.open_dirs),
+									 FilesToMerge = bitcask:readable_files(Dirname1),
+									 NewState = prep_mstate(Split1, Split2, Dirname1, Dirname2, FilesToMerge, Opts, Ref),
+									 merge_files(NewState);
+								 false ->
+									 Dirname1 = proplists:get_value(Split1, State#state.open_dirs),
+									 Dirname2 = proplists:get_value(Split2, State#state.open_dirs),
+									 FilesToMerge = bitcask:readable_files(Dirname1),
 
-							 NewState = prep_mstate(Split1, Split2, Dirname1, Dirname2, FilesToMerge, Opts, Ref),
-							 merge_files(NewState)
-					 end
-			 end,
+									 NewState = prep_mstate(Split1, Split2, Dirname1, Dirname2, FilesToMerge, Opts, Ref),
+									 merge_files(NewState)
+							 end;
+						 ActiveState ->
+							 io:format("Cannot merge split: ~p due to not being active for merging. Current state: ~p~n", [Split1, ActiveState]),
+							 throw({error, split_not_active})
+					 end,
 	case MState#mstate.out_file of
 		fresh ->
 			ok;
@@ -593,6 +601,7 @@ merge_files(#mstate{origin_dirname = Dirname,
 	merge_files(State2#mstate{input_files = Rest}).
 
 merge_single_entry(KeyDirKey, DiskKey, V, Tstamp, TstampExpire, FileId, {_, _, Offset, _} = Pos, State) ->
+	ct:pal("MergeSingleEntry key: ~p~n", [make_riak_key(KeyDirKey)]),
 	case bitcask:out_of_date(State, KeyDirKey, Tstamp, bitcask:is_key_expired(TstampExpire), FileId, Pos, State#mstate.expiry_time,
 			false, [State#mstate.origin_live_keydir, State#mstate.del_keydir]) of
 		expired ->
@@ -620,7 +629,7 @@ merge_single_entry(KeyDirKey, DiskKey, V, Tstamp, TstampExpire, FileId, {_, _, O
 	end.
 
 transfer_split(KeyDirKey, DiskKey, V, Tstamp, TstampExpire, _FileId, {_, _, _Offset, _} = _Pos, #mstate{destination_splitname = DestinationSplit, upgrade_key_fun = UpgradeKeyFun, upgrade_key = UpgradeKey} = State) ->
-	{KeyDirKey1, _DiskKey1} = case UpgradeKey of
+	{KeyDirKey1, DiskKey1} = case UpgradeKey of
 		false ->
 			{KeyDirKey, DiskKey};
 		true ->
@@ -628,7 +637,7 @@ transfer_split(KeyDirKey, DiskKey, V, Tstamp, TstampExpire, _FileId, {_, _, _Off
 			NewDiskKey 	 = UpgradeKeyFun(DestinationSplit, DiskKey),
 			{NewKeyDirKey, NewDiskKey}
 	end,
-
+ct:pal("transfer split key: ~p~n", [make_riak_key(KeyDirKey)]),
 	State1 =
 		case bitcask_fileops:check_write(State#mstate.out_file,
 			DiskKey, size(V),
@@ -665,7 +674,7 @@ transfer_split(KeyDirKey, DiskKey, V, Tstamp, TstampExpire, _FileId, {_, _, _Off
 		end,
 
 	{ok, Outfile, Offset, Size} =
-		bitcask_fileops:write(State1#mstate.out_file, DiskKey, V, Tstamp),
+		bitcask_fileops:write(State1#mstate.out_file, DiskKey1, V, Tstamp),
 
 	OutFileId = bitcask_fileops:file_tstamp(Outfile),
 
@@ -830,6 +839,43 @@ prep_mstate(Split1, Split2, Dirname1, Dirname2, FilesToMerge, Opts, Ref) ->
 		opts = Opts,
 		delete_files = []}.
 
+make_riak_key(<<?VERSION_3:7, HasType:1, SplitSz:16/integer, Split:SplitSz/bytes, Sz:16/integer,
+	TypeOrBucket:Sz/bytes, Rest/binary>>) ->
+	case HasType of
+		0 ->
+			%% no type, first field is bucket
+			{Split, TypeOrBucket, Rest};
+		1 ->
+			%% has a tyoe, extract bucket as well
+			<<BucketSz:16/integer, Bucket:BucketSz/bytes, Key/binary>> = Rest,
+			{Split, {TypeOrBucket, Bucket}, Key}
+	end;
+make_riak_key(<<?VERSION_2:7, HasType:1, Sz:16/integer,
+	TypeOrBucket:Sz/bytes, Rest/binary>>) ->
+	case HasType of
+		0 ->
+			%% no type, first field is bucket
+			{TypeOrBucket, Rest};
+		1 ->
+			%% has a tyoe, extract bucket as well
+			<<BucketSz:16/integer, Bucket:BucketSz/bytes, Key/binary>> = Rest,
+			{{TypeOrBucket, Bucket}, Key}
+	end;
+make_riak_key(<<?VERSION_1:7, HasType:1, Sz:16/integer,
+	TypeOrBucket:Sz/bytes, Rest/binary>>) ->
+	case HasType of
+		0 ->
+			%% no type, first field is bucket
+			{TypeOrBucket, Rest};
+		1 ->
+			%% has a tyoe, extract bucket as well
+			<<BucketSz:16/integer, Bucket:BucketSz/bytes, Key/binary>> = Rest,
+			{{TypeOrBucket, Bucket}, Key}
+	end;
+make_riak_key(<<?VERSION_0:8, _Rest/binary>> = BK) ->
+	binary_to_term(BK);
+make_riak_key(BK) when is_binary(BK) ->
+	BK.
 
 %%%===================================================================
 %%% Internal functions
@@ -1460,6 +1506,22 @@ upgrade_keys_test() ->
 	[?assertEqual(3, Version) || #bitcask_entry{key = <<Version:7, _Rest/binary>>} <- BKeys3],
 	?assertEqual(ExpectedKeys, lists:sort(ListKeys1)),
 
+	bitcask_manager:deactivate_split(B, second),
+ct:pal("About to reverse merge"),
+	bitcask_manager:reverse_merge(B, second, default, [{max_file_size, 50}, {find_split_fun, fun find_split/1}, {upgrade_key, true}, {upgrade_key_fun, fun check_and_upgrade_key/2}]),
+
+	ListKeys2 = bitcask_manager:fold_keys(B, FoldKeysFun, [], [{split, second}]),
+	?assertEqual(ExpectedKeys, lists:sort(ListKeys2)),
+
+	DefState2 = erlang:get(DefRef),
+	SplitState2 = erlang:get(SplitRef),
+	[not_found = bitcask_nifs:keydir_get(DefState2#bc_state.keydir, Key) || Key <- Keys], %% Keys have been upgraded so originals v2 would be not_found
+	[#bitcask_entry{} = bitcask_nifs:keydir_get(DefState2#bc_state.keydir, Key) || Key <- Keys1],
+	[#bitcask_entry{} = bitcask_nifs:keydir_get(DefState2#bc_state.keydir, Key) || Key <- Keys2],
+	[not_found = bitcask_nifs:keydir_get(SplitState2#bc_state.keydir, Key) || Key <- Keys ++ Keys1 ++ Keys2], %% key now been updated so old ones not found in keydir
+%%	BKeys2 = [#bitcask_entry{} = bitcask_nifs:keydir_get(SplitState2#bc_state.keydir, Key) || Key <- Keys1],
+%%	BKeys3 = [#bitcask_entry{} = bitcask_nifs:keydir_get(SplitState2#bc_state.keydir, Key) || Key <- Keys2],
+
 	bitcask_manager:close(B).
 
 decode_key_fun(Keys, Expiry) ->
@@ -1569,43 +1631,43 @@ make_bitcask_key(3, {Bucket, Split}, Key) ->
 	BucketSz = size(Bucket),
 	<<?VERSION_3:7, 0:1, SplitSz:16/integer, Split/binary, BucketSz:16/integer, Bucket/binary, Key/binary>>.
 
-make_riak_key(<<?VERSION_3:7, HasType:1, SplitSz:16/integer, Split:SplitSz/bytes, Sz:16/integer,
-	TypeOrBucket:Sz/bytes, Rest/binary>>) ->
-	case HasType of
-		0 ->
-			%% no type, first field is bucket
-			{Split, TypeOrBucket, Rest};
-		1 ->
-			%% has a tyoe, extract bucket as well
-			<<BucketSz:16/integer, Bucket:BucketSz/bytes, Key/binary>> = Rest,
-			{Split, {TypeOrBucket, Bucket}, Key}
-	end;
-make_riak_key(<<?VERSION_2:7, HasType:1, Sz:16/integer,
-	TypeOrBucket:Sz/bytes, Rest/binary>>) ->
-	case HasType of
-		0 ->
-			%% no type, first field is bucket
-			{TypeOrBucket, Rest};
-		1 ->
-			%% has a tyoe, extract bucket as well
-			<<BucketSz:16/integer, Bucket:BucketSz/bytes, Key/binary>> = Rest,
-			{{TypeOrBucket, Bucket}, Key}
-	end;
-make_riak_key(<<?VERSION_1:7, HasType:1, Sz:16/integer,
-	TypeOrBucket:Sz/bytes, Rest/binary>>) ->
-	case HasType of
-		0 ->
-			%% no type, first field is bucket
-			{TypeOrBucket, Rest};
-		1 ->
-			%% has a tyoe, extract bucket as well
-			<<BucketSz:16/integer, Bucket:BucketSz/bytes, Key/binary>> = Rest,
-			{{TypeOrBucket, Bucket}, Key}
-	end;
-make_riak_key(<<?VERSION_0:8, _Rest/binary>> = BK) ->
-	binary_to_term(BK);
-make_riak_key(BK) when is_binary(BK) ->
-	BK.
+%%make_riak_key(<<?VERSION_3:7, HasType:1, SplitSz:16/integer, Split:SplitSz/bytes, Sz:16/integer,
+%%	TypeOrBucket:Sz/bytes, Rest/binary>>) ->
+%%	case HasType of
+%%		0 ->
+%%			%% no type, first field is bucket
+%%			{Split, TypeOrBucket, Rest};
+%%		1 ->
+%%			%% has a tyoe, extract bucket as well
+%%			<<BucketSz:16/integer, Bucket:BucketSz/bytes, Key/binary>> = Rest,
+%%			{Split, {TypeOrBucket, Bucket}, Key}
+%%	end;
+%%make_riak_key(<<?VERSION_2:7, HasType:1, Sz:16/integer,
+%%	TypeOrBucket:Sz/bytes, Rest/binary>>) ->
+%%	case HasType of
+%%		0 ->
+%%			%% no type, first field is bucket
+%%			{TypeOrBucket, Rest};
+%%		1 ->
+%%			%% has a tyoe, extract bucket as well
+%%			<<BucketSz:16/integer, Bucket:BucketSz/bytes, Key/binary>> = Rest,
+%%			{{TypeOrBucket, Bucket}, Key}
+%%	end;
+%%make_riak_key(<<?VERSION_1:7, HasType:1, Sz:16/integer,
+%%	TypeOrBucket:Sz/bytes, Rest/binary>>) ->
+%%	case HasType of
+%%		0 ->
+%%			%% no type, first field is bucket
+%%			{TypeOrBucket, Rest};
+%%		1 ->
+%%			%% has a tyoe, extract bucket as well
+%%			<<BucketSz:16/integer, Bucket:BucketSz/bytes, Key/binary>> = Rest,
+%%			{{TypeOrBucket, Bucket}, Key}
+%%	end;
+%%make_riak_key(<<?VERSION_0:8, _Rest/binary>> = BK) ->
+%%	binary_to_term(BK);
+%%make_riak_key(BK) when is_binary(BK) ->
+%%	BK.
 
 find_split(Key) ->
 	case make_riak_key(Key) of
