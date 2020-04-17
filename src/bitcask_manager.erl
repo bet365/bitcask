@@ -79,6 +79,7 @@
 	find_split_fun :: function(),
 	upgrade_key_fun :: function(),
 	upgrade_key :: boolean(),
+	partition :: integer(),
 	read_write_p :: integer(),    % integer() avoids atom -> NIF
 	opts :: list(),
 	delete_files :: [#filestate{}],
@@ -254,7 +255,14 @@ get2(Key1, Split, SplitRef, DefState, DefRef) ->
 				not_found ->
 					case bitcask_nifs:keydir_get(DefState#bc_state.keydir, Key1) of
 						not_found ->
-							not_found;
+							UpgradeKeyFun = bitcask:get_upgrade_key_fun(bitcask:get_opt(check_and_upgrade_key_fun, DefState#bc_state.opts)),
+							NewDefKey = UpgradeKeyFun(default, Key1),
+							case bitcask_nifs:keydir_get(DefState#bc_state.keydir, NewDefKey) of
+								not_found ->
+									not_found;
+								Entry ->
+									bitcask:check_get(NewDefKey, Entry, DefRef, DefState, 2)
+							end;
 						Entry ->
 							bitcask:check_get(Key1, Entry, DefRef, DefState, 2)
 					end;
@@ -560,7 +568,8 @@ merge_files(#mstate{input_files = []} = State) ->
 merge_files(#mstate{origin_dirname = Dirname,
 	input_files = [File | Rest],
 	decode_disk_key_fun = DecodeDiskKeyFun,
-	find_split_fun = FindSplitFun} = State) ->
+	find_split_fun = FindSplitFun,
+	partition = Partition} = State) ->
 	FileId = bitcask_fileops:file_tstamp(File),
 	F = fun(K0, V, Tstamp, Pos, State0) ->
 		K = try
@@ -575,13 +584,12 @@ merge_files(#mstate{origin_dirname = Dirname,
 					[K0, TxErr]),
 				State0;
 			#keyinfo{key = K1, tstamp_expire = TstampExpire} ->
-				Split = FindSplitFun(K1),
+				Split = FindSplitFun(K1, Partition),
 				DestinationSplit = State0#mstate.destination_splitname,
 				case DestinationSplit of
 					default ->
 						merge_single_entry(K1, K0, V, Tstamp, TstampExpire, FileId, Pos, State0);
 					Split ->
-%%						transfer_split(K1, K0, V, Tstamp, TstampExpire, FileId, Pos, State0);
 						merge_single_entry(K1, K0, V, Tstamp, TstampExpire, FileId, Pos, State0);
 					_ ->
 						State0
@@ -628,7 +636,10 @@ merge_single_entry(KeyDirKey, DiskKey, V, Tstamp, TstampExpire, FileId, {_, _, O
 			State
 	end.
 
-transfer_split(KeyDirKey, DiskKey, V, Tstamp, TstampExpire, _FileId, {_, _, _Offset, _} = _Pos, #mstate{destination_splitname = DestinationSplit, upgrade_key_fun = UpgradeKeyFun, upgrade_key = UpgradeKey} = State) ->
+transfer_split(KeyDirKey, DiskKey, V, Tstamp, TstampExpire, _FileId, {_, _, _Offset, _} = _Pos,
+		#mstate{destination_splitname = DestinationSplit,
+			upgrade_key_fun = UpgradeKeyFun,
+			upgrade_key = UpgradeKey} = State) ->
 	{KeyDirKey1, DiskKey1} = case UpgradeKey of
 		false ->
 			{KeyDirKey, DiskKey};
@@ -637,7 +648,7 @@ transfer_split(KeyDirKey, DiskKey, V, Tstamp, TstampExpire, _FileId, {_, _, _Off
 			NewDiskKey 	 = UpgradeKeyFun(DestinationSplit, DiskKey),
 			{NewKeyDirKey, NewDiskKey}
 	end,
-ct:pal("transfer split key: ~p~n", [make_riak_key(KeyDirKey)]),
+ct:pal("transfer split key: ~p and upgraded: ~p~n", [make_riak_key(KeyDirKey), make_riak_key(KeyDirKey1)]),
 	State1 =
 		case bitcask_fileops:check_write(State#mstate.out_file,
 			DiskKey, size(V),
@@ -758,8 +769,9 @@ prep_mstate(Split1, Split2, Dirname1, Dirname2, FilesToMerge, Opts, Ref) ->
 
 	DecodeDiskKeyFun = bitcask:get_decode_disk_key_fun(bitcask:get_opt(decode_disk_key_fun, Opts)),
 	FindSplitFun = bitcask:get_find_split_fun(bitcask:get_opt(find_split_fun, Opts)),
-	UpgradeKeyFun = bitcask:get_upgrade_key_fun(bitcask:get_opt(upgrade_key_fun, Opts)),
+	UpgradeKeyFun = bitcask:get_upgrade_key_fun(bitcask:get_opt(check_and_upgrade_key_fun, Opts)),
 	UpgradeKey = proplists:get_value(upgrade_key, Opts, false),
+	Partition = proplists:get_value(partition, Opts, undefined),
 
 	case bitcask_lockops:acquire(merge, Dirname2) of
 		{ok, Lock} ->
@@ -835,6 +847,7 @@ prep_mstate(Split1, Split2, Dirname1, Dirname2, FilesToMerge, Opts, Ref) ->
 		find_split_fun = FindSplitFun,
 		upgrade_key_fun = UpgradeKeyFun,
 		upgrade_key = UpgradeKey,
+		partition = Partition,
 		read_write_p = 0,
 		opts = Opts,
 		delete_files = []}.
@@ -973,7 +986,7 @@ manager_special_merge_test() ->
 
 	bitcask_manager:activate_split(B, second),
 
-	bitcask_manager:special_merge(B, default, second, [{max_file_size, 60}, {find_split_fun, fun find_split/1}, {upgrade_key, true}, {upgrade_key_fun, fun check_and_upgrade_key/2}]),
+	bitcask_manager:special_merge(B, default, second, [{max_file_size, 60}, {find_split_fun, fun find_split/1}, {upgrade_key, true}, {check_and_upgrade_key_fun, fun check_and_upgrade_key/2}]),
 
 	Files3 = bitcask_fileops:data_file_tstamps(DefDir),
 	Files4 = bitcask_fileops:data_file_tstamps(SplitDir),
@@ -1046,7 +1059,7 @@ fold_expired_keys_and_tombstones_test() ->
 	Expiry = bitcask_time:tstamp() - 1000,
 	PutOpts = [{tstamp_expire, Expiry}],
 	DecodeKeyFun = decode_key_fun(Keys, Expiry),
-	MergeOpts = [{decode_disk_key_fun, DecodeKeyFun}, {find_split_fun, fun find_split/1}, {upgrade_key, true}, {upgrade_key_fun, fun check_and_upgrade_key/2}],
+	MergeOpts = [{decode_disk_key_fun, DecodeKeyFun}, {find_split_fun, fun find_split/1}, {upgrade_key, true}, {check_and_upgrade_key_fun, fun check_and_upgrade_key/2}],
 
 	B = bitcask_manager:open(Dir, [{read_write, true}, {split, default} | MergeOpts]),
 	bitcask_manager:open(B, Dir, [{read_write, true}, {split, second} | MergeOpts]),
@@ -1167,7 +1180,7 @@ special_merge_and_merge_test() ->
 	[not_found = bitcask_nifs:keydir_get(DefState0#bc_state.keydir, Key) || Key <- Keys],
 	[#bitcask_entry{} = bitcask_nifs:keydir_get(SplitState0#bc_state.keydir, Key) || Key <- Keys],
 
-	bitcask_manager:special_merge(B, default, second, [{max_file_size, 50}, {find_split_fun, fun find_split/1}, {upgrade_key, true}, {upgrade_key_fun, fun check_and_upgrade_key/2}]),
+	bitcask_manager:special_merge(B, default, second, [{max_file_size, 50}, {find_split_fun, fun find_split/1}, {upgrade_key, true}, {check_and_upgrade_key_fun, fun check_and_upgrade_key/2}]),
 
 	DefState00 = erlang:get(DefRef),
 	SplitState00 = erlang:get(SplitRef),
@@ -1355,7 +1368,7 @@ reverse_merge_test() ->
 	?assertEqual(ExpectedMergeFiles5, lists:sort(Files5)),
 	?assertEqual(ExpectedMergeFiles6, lists:sort(Files6)),
 
-	bitcask_manager:reverse_merge(B, second, default, [{max_file_size, 50}, {upgrade_key, true}, {upgrade_key_fun, fun check_and_upgrade_key/2}]),
+	bitcask_manager:reverse_merge(B, second, default, [{max_file_size, 50}, {upgrade_key, true}, {check_and_upgrade_key_fun, fun check_and_upgrade_key/2}]),
 
 	BState2 = erlang:get(B),
 	DefState2 = erlang:get(DefRef),
@@ -1417,7 +1430,7 @@ reverse_merge2_test() ->
 	?assertEqual(ExpectedMergeFiles1, lists:sort(Files1)),
 	?assertEqual([], Files2),
 
-	bitcask_manager:special_merge(B, default, second, [{max_file_size, 50}, {find_split_fun, fun find_split/1}, {upgrade_key, true}, {upgrade_key_fun, fun check_and_upgrade_key/2}]),
+	bitcask_manager:special_merge(B, default, second, [{max_file_size, 50}, {find_split_fun, fun find_split/1}, {upgrade_key, true}, {check_and_upgrade_key_fun, fun check_and_upgrade_key/2}]),
 
 	%% Confirm Data has been moved to new location and is retrievable
 	DefState1 = erlang:get(DefRef),
@@ -1435,7 +1448,7 @@ reverse_merge2_test() ->
 	?assertEqual(ExpectedMergeFiles2, lists:sort(Files3)),
 	?assertEqual(ExpectedMergeFiles3, lists:sort(Files4)),
 
-	bitcask_manager:reverse_merge(B, second, default, [{max_file_size, 50}, {upgrade_key, true}, {upgrade_key_fun, fun check_and_upgrade_key/2}]),
+	bitcask_manager:reverse_merge(B, second, default, [{max_file_size, 50}, {upgrade_key, true}, {check_and_upgrade_key_fun, fun check_and_upgrade_key/2}]),
 
 	DefState2 = erlang:get(DefRef),
 	SplitState2 = erlang:get(SplitRef),
@@ -1492,7 +1505,7 @@ upgrade_keys_test() ->
 
 	bitcask_manager:activate_split(B, second),
 
-	bitcask_manager:special_merge(B, default, second, [{max_file_size, 50}, {find_split_fun, fun find_split/1}, {upgrade_key, true}, {upgrade_key_fun, fun check_and_upgrade_key/2}]),
+	bitcask_manager:special_merge(B, default, second, [{max_file_size, 50}, {find_split_fun, fun find_split/1}, {upgrade_key, true}, {check_and_upgrade_key_fun, fun check_and_upgrade_key/2}]),
 
 	ListKeys1 = bitcask_manager:fold_keys(B, FoldKeysFun, [], [{split, second}]),
 
@@ -1508,7 +1521,7 @@ upgrade_keys_test() ->
 
 	bitcask_manager:deactivate_split(B, second),
 ct:pal("About to reverse merge"),
-	bitcask_manager:reverse_merge(B, second, default, [{max_file_size, 50}, {find_split_fun, fun find_split/1}, {upgrade_key, true}, {upgrade_key_fun, fun check_and_upgrade_key/2}]),
+	bitcask_manager:reverse_merge(B, second, default, [{max_file_size, 50}, {find_split_fun, fun find_split/1}, {upgrade_key, true}, {check_and_upgrade_key_fun, fun check_and_upgrade_key/2}]),
 
 	ListKeys2 = bitcask_manager:fold_keys(B, FoldKeysFun, [], [{split, second}]),
 	?assertEqual(ExpectedKeys, lists:sort(ListKeys2)),
