@@ -46,6 +46,7 @@
          is_tombstone/1,
          wrap_write_file/1,
          check_get/5,
+         get_encode_disk_key_fun/1,
          get_decode_disk_key_fun/1,
          get_find_split_fun/1,
          get_upgrade_key_fun/1,
@@ -2139,9 +2140,9 @@ default_decode_disk_key_fun(Key) ->
 get_find_split_fun(Fun) when is_function(Fun) ->
   Fun;
 get_find_split_fun(_) ->
-  fun default_find_split_fun/1.
+  fun default_find_split_fun/2.
 
-default_find_split_fun(Key) ->
+default_find_split_fun(Key, _) ->
   Key.
 
 
