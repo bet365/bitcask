@@ -272,7 +272,6 @@ get2(Key1, Split, SplitRef, DefState, DefRef) ->
 			end
 	end.
 
-%% TODO Potentially check and upgrade keys when putting if the split is active
 put(Ref, Key, Value) ->
 	put(Ref, Key, Value, []).
 put(Ref, Key1, Value, Opts) ->
@@ -405,10 +404,20 @@ fold_keys(Ref, Fun, Acc, Opts, MaxAge, MaxPuts, SeeTombStoneP) ->
 						true ->
 							bitcask:fold_keys(SplitRef, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP)
 					end;
-				_ ->
-					ct:pal("Are we folding in default location?"),
+				eliminate ->
 					{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
-					bitcask:fold_keys(DefRef, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP)
+					bitcask:fold_keys(DefRef, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP);
+				_ ->
+					case HasMerged of
+						true ->
+							{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
+							DefKeys = bitcask:fold_keys(DefRef, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP),
+							SplitKeys = bitcask:fold_keys(SplitRef, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP),
+							lists:flatten([DefKeys, SplitKeys]);
+						false ->
+							{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
+							bitcask:fold_keys(DefRef, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP)
+					end
 			end;
 		true ->
 			case [bitcask:fold_keys(SplitRef0, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP) || {_Split0, SplitRef0, _, SplitActive} <- OpenInstances, SplitActive =:= true] of
