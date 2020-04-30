@@ -142,7 +142,9 @@ close(Ref, Split) ->
 	{Split, SplitRef, _, DeactivedState} = lists:keyfind(Split, 1, State#state.open_instances),
 	{Split, SplitDir} = lists:keyfind(Split, 1, State#state.open_dirs),
 	case DeactivedState of
-		eliminate ->
+		true ->
+			error;
+		_ -> %% Allow removal if in either false or eliminate?
 			bitcask:close(SplitRef),
 			NewOpenInstances = lists:keydelete(Split, 1, State#state.open_instances),
 			NewOpenDirs = lists:keydelete(Split, 1, State#state.open_dirs),
@@ -150,9 +152,7 @@ close(Ref, Split) ->
 			erlang:put(Ref, NewState),
 
 			%% Clean up dir location
-			os:cmd("rm -rf " ++ SplitDir);
-		_ ->
-			error
+			os:cmd("rm -rf " ++ SplitDir)
 	end,
 
 
