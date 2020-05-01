@@ -524,8 +524,12 @@ special_merge2(Ref, Split1, Split2, Opts) ->
 	MState = case IsActive2 of
 						 true ->
 							 case HasMerged2 of
-								 true when Split2 =/= default ->
-									 io:format("This Split has already been merged: ~p~n", [Split2]);
+								 true when Split2 =/= default ->	%%TODO this should only appear if special_merge is called for a second time. Should we merge files or not, a second activate would have to be processed so no data is lost too?
+									 io:format("This Split has already been merged: ~p~n", [Split2]),
+									 Dirname1 = proplists:get_value(Split1, State#state.open_dirs),
+									 Dirname2 = proplists:get_value(Split2, State#state.open_dirs),
+									 NewState = prep_mstate(Split1, Split2, Dirname1, Dirname2, [], Opts, Ref),
+									 merge_files(NewState);	%% Will not merge since input files are []
 								 true when Split2 =:= default ->
 									 Dirname1 = proplists:get_value(Split1, State#state.open_dirs),
 									 Dirname2 = proplists:get_value(Split2, State#state.open_dirs),
@@ -536,13 +540,15 @@ special_merge2(Ref, Split1, Split2, Opts) ->
 									 Dirname1 = proplists:get_value(Split1, State#state.open_dirs),
 									 Dirname2 = proplists:get_value(Split2, State#state.open_dirs),
 									 FilesToMerge = bitcask:readable_files(Dirname1),
-
 									 NewState = prep_mstate(Split1, Split2, Dirname1, Dirname2, FilesToMerge, Opts, Ref),
 									 merge_files(NewState)
 							 end;
 						 ActiveState ->
 							 io:format("Cannot merge split: ~p due to not being active for merging. Current state: ~p~n", [Split1, ActiveState]),
-							 throw({error, split_not_active})
+							 Dirname1 = proplists:get_value(Split1, State#state.open_dirs),
+							 Dirname2 = proplists:get_value(Split2, State#state.open_dirs),
+							 NewState = prep_mstate(Split1, Split2, Dirname1, Dirname2, [], Opts, Ref),
+							 merge_files(NewState)
 					 end,
 	case MState#mstate.out_file of
 		fresh ->
