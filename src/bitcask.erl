@@ -304,6 +304,7 @@ get(Ref, Key, TryNum) ->
             end
     end.
 
+-spec check_get(binary(), binary(), reference(), record(), integer()) -> binary() | not_found.
 check_get(Key, E, Ref, State, TryNum) when is_record(E, bitcask_entry) ->
     case E#bitcask_entry.tstamp < expiry_time(State#bc_state.opts) orelse
         is_key_expired(E#bitcask_entry.tstamp_expire) of
