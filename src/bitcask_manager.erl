@@ -589,15 +589,21 @@ has_merged(Ref, Split) ->
 -spec is_empty_estimate(reference()) -> boolean().
 is_empty_estimate(Ref) ->
 	State = erlang:get(Ref),
-	{default, BRef, _, _} = lists:keyfind(default, 1, State#state.open_instances),
-	bitcask:is_empty_estimate(BRef).
+	lists:all(fun({_, BRef, _, _}) -> bitcask:is_empty_estimate(BRef) end, State#state.open_instances).
 
 -spec status(reference()) -> {integer(), [{string(), integer(), integer(), integer()}]}.
 status(Ref) ->
 	State = erlang:get(Ref),
-	{default, BRef, _, _} = lists:keyfind(default, 1, State#state.open_instances),
-	[bitcask:status(BRef)].
-%%	[bitcask:status(erlang:get(BRef)) || {_, BRef, _, _} <- OpenInstances].
+	{KC, SL} = lists:foldl(fun(BRef, Acc) ->
+		{KeyCount, StatusList} = bitcask:status(BRef),
+		case Acc of
+			{} ->
+				{KeyCount, StatusList};
+			{KeyCountAcc, StatusAcc} ->
+				{KeyCount + KeyCountAcc, [StatusList | StatusAcc]}
+		end
+				end, {}, State#state.open_instances),
+	{KC, lists:flatten(SL)}.
 
 %%%===================================================================
 %%% Internal functions
