@@ -27,10 +27,8 @@
 	list_keys/2,
 	fold_keys/3,
 	fold_keys/4,
-	fold_keys/7,
 	fold/3,
 	fold/4,
-	fold/7,
 	merge/2,
 	merge/3,
 	special_merge/4,
@@ -371,27 +369,8 @@ list_keys(Ref, Opts) ->
 fold_keys(Ref, Fun, Acc) ->
 	fold_keys(Ref, Fun, Acc, []).
 
--spec fold_keys(reference(), fun(), term(), list()) -> term() | {error, any()}.
+-spec fold_keys(reference(), fun(), term(), list())-> term | {error, any()}.
 fold_keys(Ref, Fun, Acc, Opts) ->
-	Split = proplists:get_value(split, Opts, default),
-	State = erlang:get(Ref),
-	{_Split, SplitRef, _HasMerged, _Active} =
-		case lists:keyfind(Split, 1, State#state.open_instances) of
-			false ->
-				lists:keyfind(default, 1, State#state.open_instances);
-			SplitData ->
-				SplitData
-		end,
-	SplitState = erlang:get(SplitRef),
-
-	MaxAge = bitcask:get_opt(max_fold_age, SplitState#bc_state.opts) * 1000, % convert from ms to us
-	MaxPuts = bitcask:get_opt(max_fold_puts, SplitState#bc_state.opts),
-
-	fold_keys(Ref, Fun, Acc, Opts, MaxAge, MaxPuts, false).
-
--spec fold_keys(reference(), fun(), term(), list(), non_neg_integer() | undefined,
-	non_neg_integer() | undefined, boolean()) -> term | {error, any()}.
-fold_keys(Ref, Fun, Acc, Opts, MaxAge, MaxPuts, SeeTombStoneP) ->
 	Split = proplists:get_value(split, Opts, default),
 	State = erlang:get(Ref),
 	OpenInstances = State#state.open_instances,
@@ -408,34 +387,34 @@ fold_keys(Ref, Fun, Acc, Opts, MaxAge, MaxPuts, SeeTombStoneP) ->
 			case Active of
 				true when Split1 =:= default ->
 					{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
-					bitcask:fold_keys(DefRef, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP);
+					bitcask:fold_keys(DefRef, Fun, Acc);
 				true ->
 					case HasMerged of
 						false ->
 							{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
-							DefKeys = bitcask:fold_keys(DefRef, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP),
-							SplitKeys = bitcask:fold_keys(SplitRef, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP),
+							DefKeys = bitcask:fold_keys(DefRef, Fun, Acc),
+							SplitKeys = bitcask:fold_keys(SplitRef, Fun, Acc),
 							lists:flatten([DefKeys, SplitKeys]);
 						true ->
-							bitcask:fold_keys(SplitRef, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP)
+							bitcask:fold_keys(SplitRef, Fun, Acc)
 					end;
 				eliminate ->
 					{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
-					bitcask:fold_keys(DefRef, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP);
+					bitcask:fold_keys(DefRef, Fun, Acc);
 				_ ->
 					case HasMerged of
 						true ->
 							{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
-							DefKeys = bitcask:fold_keys(DefRef, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP),
-							SplitKeys = bitcask:fold_keys(SplitRef, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP),
+							DefKeys = bitcask:fold_keys(DefRef, Fun, Acc),
+							SplitKeys = bitcask:fold_keys(SplitRef, Fun, Acc),
 							lists:flatten([DefKeys, SplitKeys]);
 						false ->
 							{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
-							bitcask:fold_keys(DefRef, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP)
+							bitcask:fold_keys(DefRef, Fun, Acc)
 					end
 			end;
 		true ->
-			case [bitcask:fold_keys(SplitRef0, Fun, Acc, MaxAge, MaxPuts, SeeTombStoneP) || {_Split0, SplitRef0, _, SplitActive} <- OpenInstances, SplitActive =:= true] of
+			case [bitcask:fold_keys(SplitRef0, Fun, Acc) || {_Split0, SplitRef0, _, SplitActive} <- OpenInstances, SplitActive =:= true] of
 				Acc1 when is_tuple(hd(Acc1)) ->
 					OutPut = lists:flatten([X || {X, _} <- Acc1]),
 					{OutPut, element(2, hd(Acc1))};
@@ -450,22 +429,9 @@ fold_keys(Ref, Fun, Acc, Opts, MaxAge, MaxPuts, SeeTombStoneP) ->
 fold(Ref, Fun, Acc) ->
 	fold(Ref, Fun, Acc, []).
 
-fold(Ref, Fun, Acc, Opts) ->
-	Split = proplists:get_value(split, Opts, default),
-	State = erlang:get(Ref),
-	{Split, SplitRef, _, _} = lists:keyfind(Split, 1, State#state.open_instances),
-	SplitState = erlang:get(SplitRef),
-
-	MaxAge = bitcask:get_opt(max_fold_age, SplitState#bc_state.opts) * 1000, % convert from ms to us
-	MaxPuts = bitcask:get_opt(max_fold_puts, SplitState#bc_state.opts),
-	SeeTombstonesP = bitcask:get_opt(fold_tombstones, SplitState#bc_state.opts) /= undefined,
-
-	fold(Ref, Fun, Acc, Opts, MaxAge, MaxPuts, SeeTombstonesP).
-
--spec fold(reference() | tuple(), fun((binary(), binary(), any()) -> any()), any(),
-	list(), non_neg_integer() | undefined, non_neg_integer() | undefined, boolean()) ->
+-spec fold(reference() | tuple(), fun((binary(), binary(), any()) -> any()), any(), list()) ->
 	any() | {error, any()}.
-fold(Ref, Fun, Acc, Opts, MaxAge, MaxPut, SeeTombstonesP) ->
+fold(Ref, Fun, Acc, Opts) ->
 	Split = proplists:get_value(split, Opts, default),
 	State = erlang:get(Ref),
 	OpenInstances = State#state.open_instances,
@@ -476,23 +442,23 @@ fold(Ref, Fun, Acc, Opts, MaxAge, MaxPut, SeeTombstonesP) ->
 			case Active of
 				true when Split =:= default ->
 					{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
-					bitcask:fold(DefRef, Fun, Acc, MaxAge, MaxPut, SeeTombstonesP);
+					bitcask:fold(DefRef, Fun, Acc);
 				true ->
 					case HasMerged of
 						false ->
 							{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
-							DefKeys = bitcask:fold(DefRef, Fun, Acc, MaxAge, MaxPut, SeeTombstonesP),
-							SplitKeys = bitcask:fold(SplitRef, Fun, Acc, MaxAge, MaxPut, SeeTombstonesP),
+							DefKeys = bitcask:fold(DefRef, Fun, Acc),
+							SplitKeys = bitcask:fold(SplitRef, Fun, Acc),
 							lists:flatten([DefKeys, SplitKeys]);
 						true ->
-							bitcask:fold(SplitRef, Fun, Acc, MaxAge, MaxPut, SeeTombstonesP)
+							bitcask:fold(SplitRef, Fun, Acc)
 					end;
 				_ ->
 					{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
-					bitcask:fold(DefRef, Fun, Acc, MaxAge, MaxPut, SeeTombstonesP)
+					bitcask:fold(DefRef, Fun, Acc)
 			end;
 		true ->
-			lists:flatten([bitcask:fold(SplitRef0, Fun, Acc, MaxAge, MaxPut, SeeTombstonesP) || {_, SplitRef0, _, _} <- OpenInstances])
+			lists:flatten([bitcask:fold(SplitRef0, Fun, Acc) || {_, SplitRef0, _, _} <- OpenInstances])
 	end.
 
 -spec merge(reference(), list()) -> ok | {error, any()}.
