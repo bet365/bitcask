@@ -90,22 +90,6 @@
 %% This atom is the signal that it failed but is harmless in this situation.
 -define(POLL_FOR_MERGE_LOCK_PSEUDOFAILURE, pseudo_failure).
 
-%% @type bc_state().
--record(bc_state, {dirname :: string(),
-                   write_file :: #filestate{} | fresh | undefined,     % File for writing
-                   write_lock :: reference() | undefined,     % Reference to write lock
-                   read_files = [] :: [#filestate{}],     % Files opened for reading
-                   max_file_size = 0 :: integer(),  % Max. size of a written file
-                   opts = [] :: list(),           % Original options used to open the bitcask
-                   encode_disk_key_fun :: function(),
-                   decode_disk_key_fun :: function(),
-                   keydir :: reference(),       % Key directory
-                   read_write_p = 0 :: integer(),    % integer() avoids atom -> NIF
-                   % What tombstone style to write, for testing purposes only.
-                   % 0 = old style without file id, 2 = new style with file id
-                   tombstone_version = 2 :: 0 | 2
-                  }).
-
 -ifdef(namespaced_types).
 -type bitcask_set() :: sets:set().
 -else.
@@ -304,7 +288,7 @@ get(Ref, Key, TryNum) ->
             end
     end.
 
--spec check_get(binary(), binary(), reference(), record(), integer()) -> binary() | not_found.
+-spec check_get(binary(), binary(), reference(), tuple(), integer()) -> binary() | not_found.
 check_get(Key, E, Ref, State, TryNum) when is_record(E, bitcask_entry) ->
     case E#bitcask_entry.tstamp < expiry_time(State#bc_state.opts) orelse
         is_key_expired(E#bitcask_entry.tstamp_expire) of
