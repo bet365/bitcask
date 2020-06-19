@@ -560,7 +560,7 @@ is_empty_estimate(Ref) ->
 -spec status(reference()) -> {integer(), [{string(), integer(), integer(), integer()}]}.
 status(Ref) ->
 	State = erlang:get(Ref),
-	{KC, SL} = lists:foldl(fun(BRef, Acc) ->
+	{KC, SL} = lists:foldl(fun({_Split, BRef, _, _}, Acc) ->
 		{KeyCount, StatusList} = bitcask:status(BRef),
 		case Acc of
 			{} ->
