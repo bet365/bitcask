@@ -276,6 +276,7 @@ get2(Key1, Split, SplitRef, DefState, DefRef) ->
 			end
 	end.
 
+%% TODO Do we need split in the name anymore?
 -spec put(reference(), binary(), binary()) -> ok | {error, term()}.
 put(Ref, Key, Value) ->
 	put(Ref, Key, Value, []).
@@ -302,7 +303,20 @@ put(Ref, Key1, Value, Opts) ->
 					DefState = erlang:get(DefRef),
 					case bitcask_nifs:keydir_get(DefState#bc_state.keydir, Key1) of
 						not_found ->
-							bitcask:put(BitcaskRef, Key1, Value, Opts);
+							UpgradeKeyFun = bitcask:get_upgrade_key_fun(bitcask:get_opt(check_and_upgrade_key_fun, DefState#bc_state.opts)),
+							NewDefKey = UpgradeKeyFun(default, Key1),
+							case bitcask_nifs:keydir_get(DefState#bc_state.keydir, NewDefKey) of
+								not_found ->
+									bitcask:put(BitcaskRef, Key1, Value, Opts);
+								_ ->
+									bitcask:delete(DefRef, NewDefKey, Opts),
+									case bitcask_nifs:keydir_get(DefState#bc_state.keydir, Key1) of
+										not_found ->
+											bitcask:put(BitcaskRef, Key1, Value, Opts);
+										_ ->
+											error_could_not_put
+									end
+							end;
 						_ ->
 							bitcask:delete(DefRef, Key1, Opts),
 							case bitcask_nifs:keydir_get(DefState#bc_state.keydir, Key1) of
