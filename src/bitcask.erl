@@ -49,7 +49,6 @@
          get_encode_disk_key_fun/1,
          get_decode_disk_key_fun/1,
          get_find_split_fun/1,
-         get_upgrade_key_fun/1,
          readable_files/1,
          expiry_time/1,
          expiry_grace_time/1,
@@ -2128,15 +2127,6 @@ get_find_split_fun(_) ->
   fun default_find_split_fun/2.
 
 default_find_split_fun(Key, _) ->
-  Key.
-
-
-get_upgrade_key_fun(Fun) when is_function(Fun) ->
-  Fun;
-get_upgrade_key_fun(_) ->
-  fun default_upgrade_key_fun/2.
-
-default_upgrade_key_fun(_Split, Key) ->
   Key.
 
 
