@@ -14,6 +14,7 @@
 	open/1,
 	open/2,
 	open/3,
+	open_with_existing/3,
 	close/1,
 	close/2,
 	activate_split/2,
@@ -103,13 +104,24 @@ open(Dir) ->
 	open(Dir, []).
 -spec open(string(), list()) -> reference().
 open(Dir, Opts) ->
-	Split = proplists:get_value(split, Opts, default),
-	NewDir = lists:concat([Dir, "/", atom_to_list(Split)]),
-	BitcaskRef = bitcask:open(NewDir, Opts),
-	State = #state{open_instances = [{Split, BitcaskRef, true, true}], open_dirs = [{Split, NewDir}]},
-	Ref = make_ref(),
-	erlang:put(Ref, State),
-	Ref.
+	Split = proplists:get_value(split, Opts),
+	case Split of
+		undefined ->
+			%% In this case we want to use the passed in directory.
+			%% If data exists in passed in directory and we create a sub one we'd lose previous data.
+			BitcaskRef = bitcask:open(Dir, Opts),
+			State = #state{open_instances = [{default, BitcaskRef, true, true}], open_dirs = [{default, Dir}]},
+			Ref = make_ref(),
+			erlang:put(Ref, State),
+			Ref;
+		_ ->
+			NewDir = lists:concat([Dir, "/", atom_to_list(Split)]),
+			BitcaskRef = bitcask:open(NewDir, Opts),
+			State = #state{open_instances = [{Split, BitcaskRef, true, true}], open_dirs = [{Split, NewDir}]},
+			Ref = make_ref(),
+			erlang:put(Ref, State),
+			Ref
+	end.
 -spec open(reference(), string(), list()) -> reference().
 open(Ref, Dir, Opts) ->
 	State = erlang:get(Ref),
@@ -131,6 +143,16 @@ open(Ref, Dir, Opts) ->
 			io:format("Bitcask instance already open for Dir: ~p and Split: ~p~n", [Dir, Split]),
 			Ref
 	end.
+
+-spec open_with_existing(reference(), string(), list()) -> reference().
+open_with_existing(BitcaskRef, Dir, Opts) ->
+	BitcaskState = erlang:get(BitcaskRef),
+	BitcaskDir = BitcaskState#bc_state.dirname, %% Dont think this even needs doing, just use passed in Dir?
+	ManagerState = #state{open_instances = [{default, BitcaskRef, true, true}], open_dirs = [{default, BitcaskDir}]},
+	ManagerRef = make_ref(),
+	erlang:put(ManagerRef, ManagerState),
+	open(ManagerRef, Dir, Opts).
+
 
 -spec close(reference()) -> ok.
 close(Ref) ->
