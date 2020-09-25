@@ -757,6 +757,13 @@ prep_mstate(Split1, Split2, Dirname1, Dirname2, FilesToMerge, Opts, Ref) ->
 				end,
 	{ok, DelKeyDir} = bitcask_nifs:keydir_new(),
 
+	Completed = case InFiles of
+		[] ->
+			true;
+		_ ->
+			false
+	end,
+
 	#mstate{origin_dirname = Dirname1,
 		destination_dirname = Dirname2,
 		origin_splitname = Split1,
@@ -782,7 +789,7 @@ prep_mstate(Split1, Split2, Dirname1, Dirname2, FilesToMerge, Opts, Ref) ->
 		current_count = 0,
 		merge_count = MergeCounter,
 		merge_listen_time = ListenTime,
-		completed = false,
+		completed = Completed,
 		read_write_p = 0,
 		opts = Opts,
 		delete_files = []}.
