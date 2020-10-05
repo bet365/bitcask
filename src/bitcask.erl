@@ -237,8 +237,6 @@ get(Ref, Key) ->
 
 -spec get(reference(), binary(), integer()) ->
                  not_found | {ok, Value::binary()} | {error, Err::term()}.
-get(Ref, Key, TryNum) when false =:= is_integer(TryNum) ->
-  get(Ref, Key, 2);
 get(_Ref, _Key, 0) -> {error, nofile};
 get(Ref, Key, TryNum) ->
     State = get_state(Ref),

@@ -81,8 +81,6 @@
 	decode_disk_key_fun :: function(),
 	encode_disk_key_fun :: function(),
 	find_split_fun :: function(),
-%%	upgrade_key_fun :: function(),
-%%	upgrade_key :: boolean(),
 	partition :: integer(),
 	current_count :: integer(),
 	merge_count :: integer(),
@@ -98,7 +96,7 @@
 -endif.
 
 -record(state, {
-	open_instances :: [{atom(), reference(), boolean(), boolean()}], %% {split, ref, has_merged, is_activated}
+	open_instances :: [{atom(), reference(), boolean(), boolean()}], %% {split, bitcask_ref, has_merged, is_activated}
 	open_dirs :: [{atom(), string()}]
 }).
 
@@ -106,7 +104,6 @@
 %%%===================================================================
 %%% API
 %%%===================================================================
-%% TODO Update how we open splits for default, the location should be /partition/ and not /partition/default or else we'll not pick up data which already exists when rolling out to prod
 -spec open(string()) -> reference().
 open(Dir) ->
 	open(Dir, []).
@@ -291,14 +288,6 @@ get2(Key1, Split, SplitRef, DefState, DefRef) ->
 					case bitcask_nifs:keydir_get(DefState#bc_state.keydir, Key1) of
 						not_found ->
 							not_found;
-%%							UpgradeKeyFun = bitcask:get_upgrade_key_fun(bitcask:get_opt(check_and_upgrade_key_fun, DefState#bc_state.opts)),
-%%							NewDefKey = UpgradeKeyFun(default, Key1),
-%%							case bitcask_nifs:keydir_get(DefState#bc_state.keydir, NewDefKey) of
-%%								not_found ->
-%%									not_found;
-%%								Entry ->
-%%									bitcask:check_get(NewDefKey, Entry, DefRef, DefState, 2)
-%%							end;
 						Entry ->
 							bitcask:check_get(Key1, Entry, DefRef, DefState, 2)
 					end;
@@ -307,7 +296,6 @@ get2(Key1, Split, SplitRef, DefState, DefRef) ->
 			end
 	end.
 
-%% TODO Do we need split in the name anymore?
 -spec put(reference(), binary(), binary()) -> ok | {error, term()}.
 put(Ref, Key, Value) ->
 	put(Ref, Key, Value, []).
@@ -335,20 +323,6 @@ put(Ref, Key1, Value, Opts) ->
 					case bitcask_nifs:keydir_get(DefState#bc_state.keydir, Key1) of
 						not_found ->
 							bitcask:put(BitcaskRef, Key1, Value, Opts);
-%%							UpgradeKeyFun = bitcask:get_upgrade_key_fun(bitcask:get_opt(check_and_upgrade_key_fun, DefState#bc_state.opts)),
-%%							NewDefKey = UpgradeKeyFun(default, Key1),
-%%							case bitcask_nifs:keydir_get(DefState#bc_state.keydir, NewDefKey) of
-%%								not_found ->
-%%									bitcask:put(BitcaskRef, Key1, Value, Opts);
-%%								_ ->
-%%									bitcask:delete(DefRef, NewDefKey, Opts),
-%%									case bitcask_nifs:keydir_get(DefState#bc_state.keydir, Key1) of
-%%										not_found ->
-%%											bitcask:put(BitcaskRef, Key1, Value, Opts);
-%%										_ ->
-%%											error_could_not_put
-%%									end
-%%							end;
 						_ ->
 							bitcask:delete(DefRef, Key1, Opts),
 							case bitcask_nifs:keydir_get(DefState#bc_state.keydir, Key1) of
@@ -485,7 +459,6 @@ fold(Ref, Fun, Acc, Opts) ->
 	AllSplits = proplists:get_value(all_splits, Opts, false),
 	case AllSplits of
 		false ->
-			%% TODO Add eliminate clause like for fold_keys above
 			case Active of
 				true when Split =:= default ->
 					{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
@@ -500,11 +473,22 @@ fold(Ref, Fun, Acc, Opts) ->
 						true ->
 							bitcask:fold(SplitRef, Fun, Acc)
 					end;
-				_ ->
+				eliminate ->
 					{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
-					bitcask:fold(DefRef, Fun, Acc)
+					bitcask:fold(DefRef, Fun, Acc);
+				_ ->
+					case HasMerged of
+						true ->
+							{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
+							DefKeys = bitcask:fold(DefRef, Fun, Acc),
+							SplitKeys = bitcask:fold(SplitRef, Fun, Acc),
+							lists:flatten([DefKeys, SplitKeys]);
+						false ->
+							{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
+							bitcask:fold(DefRef, Fun, Acc)
+					end
 			end;
-		true ->
+		true -> %% TODO does need a case clause like fold_keys above? Add tests for all splits in both folds
 			lists:flatten([bitcask:fold(SplitRef0, Fun, Acc) || {_, SplitRef0, _, _} <- OpenInstances])
 	end.
 
@@ -615,7 +599,6 @@ has_merged(Ref, Split) ->
 			false
 	end.
 
-%% TODO Both these calls need to be reviewed as to what they actually do and best way for riak to know which split to call on.
 -spec is_empty_estimate(reference()) -> boolean().
 is_empty_estimate(Ref) ->
 	State = erlang:get(Ref),
@@ -647,7 +630,7 @@ special_merge2(Ref, Split1, Split2, Opts) ->
 	MState = case IsActive2 of
 				 true ->
 					 case HasMerged2 of
-						 true when Split2 =/= default ->	%%TODO this should only appear if special_merge is called for a second time. Should we merge files or not, a second activate would have to be processed so no data is lost too?
+						 true when Split2 =/= default ->
 							 io:format("This Split has already been merged: ~p~n", [Split2]),
 							 Dirname1 = proplists:get_value(Split1, State#state.open_dirs),
 							 Dirname2 = proplists:get_value(Split2, State#state.open_dirs),
@@ -884,22 +867,8 @@ merge_single_entry(KeyDirKey, DiskKey, V, Tstamp, TstampExpire, FileId, {_, _, O
 
 transfer_split(KeyDirKey, DiskKey, V, Tstamp, TstampExpire, _FileId, {_, _, _Offset, _} = _Pos,
 	#mstate{destination_splitname = _DestinationSplit
-%%		upgrade_key_fun = UpgradeKeyFun,
-%%		upgrade_key = UpgradeKey,
-%%		decode_disk_key_fun = DecodeFun,
-%%		encode_disk_key_fun = EncodeFun
 	} = State) ->
-	{KeyDirKey1, DiskKey1} = {KeyDirKey, DiskKey},
-%%	{KeyDirKey1, DiskKey1} = case UpgradeKey of
-%%								 false ->
-%%									 {KeyDirKey, DiskKey};
-%%								 true ->
-%%									 NewKeyDirKey = UpgradeKeyFun(DestinationSplit, KeyDirKey),
-%%									 KeyRec = DecodeFun(DiskKey),
-%%									 NewDiskKey 	 = UpgradeKeyFun(DestinationSplit, KeyRec#keyinfo.key),
-%%									 EncodedDiskKey = EncodeFun(NewDiskKey, [{tstamp_expire, KeyRec#keyinfo.tstamp_expire}]),
-%%									 {NewKeyDirKey, EncodedDiskKey}
-%%							 end,
+
 	State1 =
 		case bitcask_fileops:check_write(State#mstate.out_file,
 			DiskKey, size(V),
@@ -936,12 +905,12 @@ transfer_split(KeyDirKey, DiskKey, V, Tstamp, TstampExpire, _FileId, {_, _, _Off
 		end,
 
 	{ok, Outfile, Offset, Size} =
-		bitcask_fileops:write(State1#mstate.out_file, DiskKey1, V, Tstamp),
+		bitcask_fileops:write(State1#mstate.out_file, DiskKey, V, Tstamp),
 
 	OutFileId = bitcask_fileops:file_tstamp(Outfile),
 
 	Outfile2 =
-		case bitcask_nifs:keydir_put(State1#mstate.destination_live_keydir, KeyDirKey1,
+		case bitcask_nifs:keydir_put(State1#mstate.destination_live_keydir, KeyDirKey,
 			OutFileId,
 			Size, Offset, Tstamp, TstampExpire,
 			bitcask_time:tstamp(),
@@ -983,7 +952,6 @@ transfer_split(KeyDirKey, DiskKey, V, Tstamp, TstampExpire, _FileId, {_, _, _Off
 
 	OriginWriteFile = NewSplitState#bc_state.write_file,
 
-	%% TODO review case clauses are all good and behave as should
 	case bitcask_nifs:keydir_get(State1#mstate.origin_live_keydir, KeyDirKey) of
 		#bitcask_entry{tstamp = OldTstamp, file_id = OldFileId,
 			offset = OldOffset} ->
@@ -1209,11 +1177,14 @@ fold_expired_keys_and_tombstones_test() ->
 
 	%% Check data is same after special merge
 	ListKeys3 = bitcask_manager:fold_keys(B, FoldKeysFun, [], [{split, second}]),
+%%	ListKeys4 = bitcask_manager:fold_keys(B, FoldKeysFun, [], [{split, second}, {all_splits, true}]),
 	{ListBuckets3, _} = bitcask_manager:fold_keys(B, FoldBucketsFun, {[], sets:new()}),		%% Will list only default split buckets
 	{ListBuckets4, _} = bitcask_manager:fold_keys(B, FoldBucketsFun, {[], sets:new()}, [{all_splits, true}]),
 	ListObjects3 = bitcask_manager:fold(B, FoldObjFun, [], [{split, second}]),
+	ListObjects4 = bitcask_manager:fold(B, FoldObjFun, [], [{split, second}, {all_splits, true}]),
 	?assertEqual(ExpectedKeys3, lists:sort(ListKeys3)),
 	?assertEqual(ExpectedKeys3 ++ [<<"k8">>], lists:sort(ListObjects3)),
+	?assertEqual(ExpectedKeys4 ++ [<<"k7">>] ++ [<<"k8">>], lists:sort(ListObjects4)),
 	?assertEqual([<<"b7">>, <<"new_bucket">>], lists:sort(ListBuckets3)),
 	?assertEqual([<<"b7">>, <<"b8">>] ++ ExpectedBuckets, lists:sort(ListBuckets4)),
 
@@ -1624,72 +1595,6 @@ reverse_merge2_test() ->
 	_Files6 = bitcask_fileops:data_file_tstamps(DefDir),
 	bitcask_manager:close(B).
 
-upgrade_keys_test() ->
-	os:cmd("rm -rf /tmp/bc.man.upgrade_keys"),
-	Dir = "/tmp/bc.man.upgrade_keys",
-	Keys  = [make_bitcask_key(2, <<"b1_second">>, integer_to_binary(N)) || N <- lists:seq(0,5)],	%% Old Key Type no split
-	Keys1 = [make_bitcask_key(2, <<"b1_second">>, integer_to_binary(N)) || N <- lists:seq(0,5)],	%% New Version of above keys
-	Keys2 = [make_bitcask_key(2, <<"b1_second">>, integer_to_binary(N)) || N <- lists:seq(6,9)],	%% New Keys with split
-	B = bitcask_manager:open(Dir, [{read_write, true}, {split, default}, {max_file_size, 50}]),
-	bitcask_manager:open(B, Dir, [{read_write, true}, {split, second}, {max_file_size, 50}]),
-	BState = erlang:get(B),
-	{default, DefRef, _, _} = lists:keyfind(default, 1, BState#state.open_instances),
-	{second, SplitRef, _, _} = lists:keyfind(second, 1, BState#state.open_instances),
-	DefState0 = erlang:get(DefRef),
-	SplitState0 = erlang:get(SplitRef),
-	FoldKFun = fun(_, Key, Acc) -> [Key | Acc] end,
-	FoldKeysFun = fold_keys_fun(FoldKFun, <<"b1_second">>),
-
-	[bitcask_manager:put(B, Key, Key, [{split, second}]) || Key <- Keys ++ Keys2],
-
-	%% Check versions of keys in keydir are correct
-	BKeys0 = [#bitcask_entry{} = bitcask_nifs:keydir_get(DefState0#bc_state.keydir, Key) || Key <- Keys],
-	BKeys1 = [#bitcask_entry{} = bitcask_nifs:keydir_get(DefState0#bc_state.keydir, Key) || Key <- Keys2],
-	[not_found = bitcask_nifs:keydir_get(SplitState0#bc_state.keydir, Key) || Key <- Keys ++ Keys2],
-
-	%% TODO why do these tests here not fail????
-	[?assertEqual(2, Version) || #bitcask_entry{key = <<Version:7, _Rest/binary>>} <- BKeys0],
-	[?assertEqual(6, Version) || #bitcask_entry{key = <<Version:7, _Rest/binary>>} <- BKeys1],
-
-	ListKeys = bitcask_manager:fold_keys(B, FoldKeysFun, [], [{split, second}]),
-
-	ExpectedKeys = [integer_to_binary(N) || N <- lists:seq(0,9)],
-	?assertEqual(ExpectedKeys, lists:sort(ListKeys)),
-
-	bitcask_manager:activate_split(B, second),
-
-	bitcask_manager:special_merge(B, default, second, [{max_file_size, 50}, {find_split_fun, fun find_split/2}, {upgrade_key, true}]),
-
-	ListKeys1 = bitcask_manager:fold_keys(B, FoldKeysFun, [], [{split, second}]),
-
-	DefState1 = erlang:get(DefRef),
-	SplitState1 = erlang:get(SplitRef),
-	[not_found = bitcask_nifs:keydir_get(DefState1#bc_state.keydir, Key) || Key <- Keys ++ Keys1 ++ Keys2],
-%%	[not_found = bitcask_nifs:keydir_get(SplitState1#bc_state.keydir, Key) || Key <- Keys], %% key now been updated so old ones not found in keydir
-	BKeys2 = [#bitcask_entry{} = bitcask_nifs:keydir_get(SplitState1#bc_state.keydir, Key) || Key <- Keys1],
-	BKeys3 = [#bitcask_entry{} = bitcask_nifs:keydir_get(SplitState1#bc_state.keydir, Key) || Key <- Keys2],
-	[?assertEqual(3, Version) || #bitcask_entry{key = <<Version:7, _Rest/binary>>} <- BKeys2],
-	[?assertEqual(3, Version) || #bitcask_entry{key = <<Version:7, _Rest/binary>>} <- BKeys3],
-	?assertEqual(ExpectedKeys, lists:sort(ListKeys1)),
-
-	bitcask_manager:deactivate_split(B, second),
-ct:pal("About to reverse merge"),
-	bitcask_manager:reverse_merge(B, second, default, [{max_file_size, 50}, {find_split_fun, fun find_split/2}, {upgrade_key, true}]),
-
-	ListKeys2 = bitcask_manager:fold_keys(B, FoldKeysFun, [], [{split, second}]),
-	?assertEqual(ExpectedKeys, lists:sort(ListKeys2)),
-
-	DefState2 = erlang:get(DefRef),
-	SplitState2 = erlang:get(SplitRef),
-%%	[not_found = bitcask_nifs:keydir_get(DefState2#bc_state.keydir, Key) || Key <- Keys], %% Keys have been upgraded so originals v2 would be not_found
-	[#bitcask_entry{} = bitcask_nifs:keydir_get(DefState2#bc_state.keydir, Key) || Key <- Keys1],
-	[#bitcask_entry{} = bitcask_nifs:keydir_get(DefState2#bc_state.keydir, Key) || Key <- Keys2],
-	[not_found = bitcask_nifs:keydir_get(SplitState2#bc_state.keydir, Key) || Key <- Keys ++ Keys1 ++ Keys2], %% key now been updated so old ones not found in keydir
-%%	BKeys2 = [#bitcask_entry{} = bitcask_nifs:keydir_get(SplitState2#bc_state.keydir, Key) || Key <- Keys1],
-%%	BKeys3 = [#bitcask_entry{} = bitcask_nifs:keydir_get(SplitState2#bc_state.keydir, Key) || Key <- Keys2],
-
-	bitcask_manager:close(B).
-
 decode_key_fun(Keys, Expiry) ->
 	fun(Key) ->
 		case lists:nth(2, Keys) of
@@ -1744,30 +1649,17 @@ fold_buckets_fun(FoldBucketsFun) ->
 
 fold_obj_fun(FoldObjectsFun, undefined) ->
 	fun(BK, _Value, Acc) ->
-		case make_riak_key(BK) of
-			{_S, Bucket, Key} ->
-				FoldObjectsFun(Bucket, Key, Acc);
-			{Bucket, Key} ->
-				FoldObjectsFun(Bucket, Key, Acc)
-		end
+		{Bucket, Key} = make_riak_key(BK),
+		FoldObjectsFun(Bucket, Key, Acc)
 	end;
 fold_obj_fun(FoldKeysFun, Bucket) ->
 	fun(BK, _Value, Acc) ->
-		case make_riak_key(BK) of
-			{_S, B, Key} ->
-				case B =:= Bucket of
-					true ->
-						FoldKeysFun(B, Key, Acc);
-					false ->
-						Acc
-				end;
-			{B, Key} ->
-				case B =:= Bucket of
-					true ->
-						FoldKeysFun(B, Key, Acc);
-					false ->
-						Acc
-				end
+		{B, Key} = make_riak_key(BK),
+		case B =:= Bucket of
+			true ->
+				FoldKeysFun(B, Key, Acc);
+			false ->
+				Acc
 		end
 	end.
 
@@ -1787,27 +1679,7 @@ make_bitcask_key(2, {Type, Bucket}, Key) ->
 make_bitcask_key(2, Bucket, Key) ->
 	BucketSz = size(Bucket),
 	<<?VERSION_2:7, 0:1, BucketSz:16/integer, Bucket/binary, Key/binary>>.
-%%make_bitcask_key(2, {Type, Bucket, Split}, Key) ->
-%%	TypeSz = size(Type),
-%%	BucketSz = size(Bucket),
-%%	SplitSz = size(Split),
-%%	<<?VERSION_3:7, 1:1, SplitSz:16/integer, Split/binary, TypeSz:16/integer, Type/binary, BucketSz:16/integer, Bucket/binary, Key/binary>>;
-%%make_bitcask_key(2, {Bucket, Split}, Key) ->
-%%	SplitSz = size(Split),
-%%	BucketSz = size(Bucket),
-%%	<<?VERSION_3:7, 0:1, SplitSz:16/integer, Split/binary, BucketSz:16/integer, Bucket/binary, Key/binary>>.
 
-%%make_riak_key(<<?VERSION_3:7, HasType:1, SplitSz:16/integer, Split:SplitSz/bytes, Sz:16/integer,
-%%	TypeOrBucket:Sz/bytes, Rest/binary>>) ->
-%%	case HasType of
-%%		0 ->
-%%			 no type, first field is bucket
-%%			{Split, TypeOrBucket, Rest};
-%%		1 ->
-%%			 has a tyoe, extract bucket as well
-%%			<<BucketSz:16/integer, Bucket:BucketSz/bytes, Key/binary>> = Rest,
-%%			{Split, {TypeOrBucket, Bucket}, Key}
-%%	end;
 make_riak_key(<<?VERSION_2:7, HasType:1, Sz:16/integer,
 	TypeOrBucket:Sz/bytes, Rest/binary>>) ->
 	case HasType of
@@ -1819,28 +1691,9 @@ make_riak_key(<<?VERSION_2:7, HasType:1, Sz:16/integer,
 			<<BucketSz:16/integer, Bucket:BucketSz/bytes, Key/binary>> = Rest,
 			{{TypeOrBucket, Bucket}, Key}
 	end.
-%%make_riak_key(<<?VERSION_1:7, HasType:1, Sz:16/integer,
-%%	TypeOrBucket:Sz/bytes, Rest/binary>>) ->
-%%	case HasType of
-%%		0 ->
-%%			%% no type, first field is bucket
-%%			{TypeOrBucket, Rest};
-%%		1 ->
-%%			%% has a tyoe, extract bucket as well
-%%			<<BucketSz:16/integer, Bucket:BucketSz/bytes, Key/binary>> = Rest,
-%%			{{TypeOrBucket, Bucket}, Key}
-%%	end;
-%%make_riak_key(<<?VERSION_0:8, _Rest/binary>> = BK) ->
-%%	binary_to_term(BK);
-%%make_riak_key(BK) when is_binary(BK) ->
-%%	BK.
 
 find_split(Key, _) ->
 	case make_riak_key(Key) of
-%%		{Split, {_Type, _Bucket}, _Key} ->
-%%			binary_to_atom(Split, latin1);
-%%		{Split, _Bucket, _Key} ->
-%%			binary_to_atom(Split, latin1);
 		{{_Type, Bucket}, _Key} when Bucket =:= <<"b4">> orelse Bucket =:= <<"b5">> orelse Bucket =:= <<"b6">> ->
 			second;
 		{{_Type, Bucket}, _Key} ->
@@ -1852,20 +1705,5 @@ find_split(Key, _) ->
 		_ ->
 			default
 	end.
-
-%%check_and_upgrade_key(default, <<Version:7, _Rest/bitstring>> = KeyDirKey) when Version =/= ?VERSION_3 ->
-%%	KeyDirKey;
-%%check_and_upgrade_key(Split, <<Version:7, _Rest/bitstring>> = KeyDirKey) when Version =/= ?VERSION_3 ->
-%%	case make_riak_key(KeyDirKey) of
-%%		{{Bucket, Type}, Key} ->
-%%			make_bitcask_key(2, {Type, Bucket, atom_to_binary(Split, latin1)}, Key);
-%%		{Bucket, Key} ->
-%%			NewKey = make_bitcask_key(2, {Bucket, atom_to_binary(Split, latin1)}, Key),
-%%			NewKey
-%%	end;
-%%check_and_upgrade_key(_Split, <<?VERSION_3:7, _Rest/bitstring>> = KeyDirKey) ->
-%%	KeyDirKey;
-%%check_and_upgrade_key(_Split, KeyDirKey) ->
-%%	KeyDirKey.
 
 	-endif.
