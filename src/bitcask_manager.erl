@@ -434,13 +434,17 @@ fold_keys(Ref, Fun, Acc, Opts) ->
 					end
 			end;
 		true ->
-			case [bitcask:fold_keys(SplitRef0, Fun, Acc) || {_Split0, SplitRef0, _, SplitActive} <- OpenInstances, SplitActive =:= true] of
-				Acc1 when is_tuple(hd(Acc1)) ->
-					OutPut = lists:flatten([X || {X, _} <- Acc1]),
-					{OutPut, element(2, hd(Acc1))};
-				Acc1 when is_list(hd(Acc1)) ->
-					lists:flatten(Acc1)
-			end
+			A = [bitcask:fold_keys(SplitRef0, Fun, Acc) || {_Split0, SplitRef0, _, SplitActive} <- OpenInstances, SplitActive =:= true],
+			ct:pal("A: ~p~n", [A]),
+			lists:flatten(A)
+%%			case A of
+%%				Acc1 when is_tuple(hd(Acc1)) ->
+%%					OutPut = lists:flatten([element(2, X) || X <- Acc1]),
+%%					{E, _, B, C, _D} = hd(Acc1),
+%%					[{E, OutPut, B, C, length(OutPut)}];
+%%				Acc1 when is_list(hd(Acc1)) ->
+%%					lists:flatten(Acc1)
+%%			end
 	end.
 
 -spec fold(reference() | tuple(),
