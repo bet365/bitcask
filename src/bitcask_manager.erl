@@ -389,7 +389,7 @@ list_keys(Ref, Opts) ->
 fold_keys(Ref, Fun, Acc) ->
 	fold_keys(Ref, Fun, Acc, []).
 
--spec fold_keys(reference(), fun(), term(), list())-> term | {error, any()}.
+-spec fold_keys(reference(), fun(), term(), list()) -> term | {error, any()}.
 fold_keys(Ref, Fun, Acc, Opts) ->
 	Split = proplists:get_value(split, Opts, default),
 	State = erlang:get(Ref),
@@ -412,9 +412,15 @@ fold_keys(Ref, Fun, Acc, Opts) ->
 					case HasMerged of
 						false ->
 							{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
-							DefKeys = bitcask:fold_keys(DefRef, Fun, Acc),
-							SplitKeys = bitcask:fold_keys(SplitRef, Fun, Acc),
-							lists:flatten([DefKeys, SplitKeys]);
+							case Acc of    %% Check for if its fold_buckets acc or fold_keys
+								{Acc0, Set0} ->
+									{Acc1, Set1} = bitcask:fold_keys(DefRef, Fun, {Acc0, Set0}),
+									SplitKeys = bitcask:fold_keys(SplitRef, Fun, {Acc1, Set1}),
+									SplitKeys;
+								_ ->
+									DefKeys = bitcask:fold_keys(DefRef, Fun, Acc),
+									bitcask:fold_keys(SplitRef, Fun, DefKeys)
+							end;
 						true ->
 							bitcask:fold_keys(SplitRef, Fun, Acc)
 					end;
@@ -425,26 +431,29 @@ fold_keys(Ref, Fun, Acc, Opts) ->
 					case HasMerged of
 						true ->
 							{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
-							DefKeys = bitcask:fold_keys(DefRef, Fun, Acc),
-							SplitKeys = bitcask:fold_keys(SplitRef, Fun, Acc),
-							lists:flatten([DefKeys, SplitKeys]);
+							case Acc of    %% Check for if its fold_buckets acc or fold_keys
+								{Acc0, Set0} ->
+									{Acc1, Set1} = bitcask:fold_keys(DefRef, Fun, {Acc0, Set0}),
+									SplitKeys = bitcask:fold_keys(SplitRef, Fun, {Acc1, Set1}),
+									SplitKeys;
+								_ ->
+									DefKeys = bitcask:fold_keys(DefRef, Fun, Acc),
+									bitcask:fold_keys(SplitRef, Fun, DefKeys)
+							end;
 						false ->
 							{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
 							bitcask:fold_keys(DefRef, Fun, Acc)
 					end
 			end;
 		true ->
-			A = [bitcask:fold_keys(SplitRef0, Fun, Acc) || {_Split0, SplitRef0, _, SplitActive} <- OpenInstances, SplitActive =:= true],
-			ct:pal("A: ~p~n", [A]),
-			lists:flatten(A)
-%%			case A of
-%%				Acc1 when is_tuple(hd(Acc1)) ->
-%%					OutPut = lists:flatten([element(2, X) || X <- Acc1]),
-%%					{E, _, B, C, _D} = hd(Acc1),
-%%					[{E, OutPut, B, C, length(OutPut)}];
-%%				Acc1 when is_list(hd(Acc1)) ->
-%%					lists:flatten(Acc1)
-%%			end
+			Output = lists:foldl(
+				fun
+					({_Split, SplitRef0, _MergeState, _ActiveState}, {Acc1, Set1}) ->
+						bitcask:fold_keys(SplitRef0, Fun, {Acc1, Set1});
+					({_Split, SplitRef0, _MergeState, _ActiveState}, Acc1) ->
+						bitcask:fold_keys(SplitRef0, Fun, Acc1)
+				end, Acc, OpenInstances),
+			Output
 	end.
 
 -spec fold(reference() | tuple(),
@@ -472,8 +481,7 @@ fold(Ref, Fun, Acc, Opts) ->
 						false ->
 							{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
 							DefKeys = bitcask:fold(DefRef, Fun, Acc),
-							SplitKeys = bitcask:fold(SplitRef, Fun, Acc),
-							lists:flatten([DefKeys, SplitKeys]);
+							bitcask:fold(SplitRef, Fun, DefKeys);
 						true ->
 							bitcask:fold(SplitRef, Fun, Acc)
 					end;
@@ -485,15 +493,17 @@ fold(Ref, Fun, Acc, Opts) ->
 						true ->
 							{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
 							DefKeys = bitcask:fold(DefRef, Fun, Acc),
-							SplitKeys = bitcask:fold(SplitRef, Fun, Acc),
-							lists:flatten([DefKeys, SplitKeys]);
+							bitcask:fold(SplitRef, Fun, DefKeys);
 						false ->
 							{default, DefRef, _, _} = lists:keyfind(default, 1, OpenInstances),
 							bitcask:fold(DefRef, Fun, Acc)
 					end
 			end;
-		true -> %% TODO does need a case clause like fold_keys above? Add tests for all splits in both folds
-			lists:flatten([bitcask:fold(SplitRef0, Fun, Acc) || {_, SplitRef0, _, _} <- OpenInstances])
+		true ->
+			lists:foldl(
+				fun({_Split, SplitRef0, _MergeState, _ActiveState}, Acc1) ->
+					bitcask:fold(SplitRef0, Fun, Acc1)
+				end, Acc, OpenInstances)
 	end.
 
 -spec merge(reference(), list()) -> ok | {error, any()}.
@@ -619,7 +629,7 @@ status(Ref) ->
 			{KeyCountAcc, StatusAcc} ->
 				{KeyCount + KeyCountAcc, [StatusList | StatusAcc]}
 		end
-				end, {}, State#state.open_instances),
+						   end, {}, State#state.open_instances),
 	{KC, lists:flatten(SL)}.
 
 %%%===================================================================
@@ -639,7 +649,7 @@ special_merge2(Ref, Split1, Split2, Opts) ->
 							 Dirname1 = proplists:get_value(Split1, State#state.open_dirs),
 							 Dirname2 = proplists:get_value(Split2, State#state.open_dirs),
 							 NewState = prep_mstate(Split1, Split2, Dirname1, Dirname2, [], Opts, Ref),
-							 merge_files(NewState);	%% Will not merge since input files are []
+							 merge_files(NewState);    %% Will not merge since input files are []
 						 true when Split2 =:= default ->
 							 Dirname1 = proplists:get_value(Split1, State#state.open_dirs),
 							 Dirname2 = proplists:get_value(Split2, State#state.open_dirs),
@@ -745,11 +755,11 @@ prep_mstate(Split1, Split2, Dirname1, Dirname2, FilesToMerge, Opts, Ref) ->
 	{ok, DelKeyDir} = bitcask_nifs:keydir_new(),
 
 	Completed = case InFiles of
-		[] ->
-			true;
-		_ ->
-			false
-	end,
+					[] ->
+						true;
+					_ ->
+						false
+				end,
 
 	#mstate{origin_dirname = Dirname1,
 		destination_dirname = Dirname2,
@@ -999,9 +1009,9 @@ manager_special_merge_test() ->
 	Key1 = make_bitcask_key(2, <<"b1">>, <<"k1">>),
 	Key2 = make_bitcask_key(2, <<"b2">>, <<"k2">>),
 	Key3 = make_bitcask_key(2, <<"b3">>, <<"k3">>),
-	Key4 = make_bitcask_key(2, <<"b4">>,  <<"k4">>),
-	Key5 = make_bitcask_key(2, <<"b5">>,  <<"k5">>),
-	Key6 = make_bitcask_key(2, <<"b6">>,  <<"k6">>),
+	Key4 = make_bitcask_key(2, <<"b4">>, <<"k4">>),
+	Key5 = make_bitcask_key(2, <<"b5">>, <<"k5">>),
+	Key6 = make_bitcask_key(2, <<"b6">>, <<"k6">>),
 	Keys = [{default, Key1}, {default, Key2}, {default, Key3}, {second, Key4}, {second, Key5}, {second, Key6}],
 	B = bitcask_manager:open(Dir, [{read_write, true}, {split, default}, {max_file_size, 50}]),
 	bitcask_manager:open(B, Dir, [{read_write, true}, {split, second}, {max_file_size, 50}]),
@@ -1710,4 +1720,4 @@ find_split(Key, _) ->
 			default
 	end.
 
-	-endif.
+-endif.
