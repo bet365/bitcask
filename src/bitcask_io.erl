@@ -28,11 +28,14 @@
 
 -ifdef(PULSE).
 -compile({parse_transform, pulse_instrument}).
+-include_lib("pulse_otp/include/pulse_otp.hrl").
+-compile({pulse_side_effect, [{file, '_', '_'}]}).
 -endif.
 
 -ifdef(TEST).
 -export([determine_file_module/0]).
 -include_lib("eunit/include/eunit.hrl").
+-include("bitcask.hrl").
 -endif.
 
 file_open(Filename, Opts) ->
@@ -119,7 +122,7 @@ truncate_test_() ->
     {timeout, 60, fun truncate_test2/0}.
 
 truncate_test2() ->
-    Dir = "/tmp/bc.test.bitcask_io/",
+    Dir = filename:join(?TEST_FILEPATH, "bc.test.bitcask_io/"),
     one_truncate(filename:join(Dir, "truncate_test1.dat"), 50, 50),
     one_truncate(filename:join(Dir, "truncate_test2.dat"), {bof, 50}, 50),
     one_truncate(filename:join(Dir, "truncate_test3.dat"), {cur, -25}, 75),

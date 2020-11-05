@@ -68,7 +68,7 @@
 
 -ifdef(PULSE).
 -compile({parse_transform, pulse_instrument}).
--export([set_pulse_pid/1]).
+-include_lib("pulse_otp/include/pulse_otp.hrl").
 -compile({pulse_skip, [{init,0}]}).
 -endif.
 
@@ -76,7 +76,7 @@
 -ifdef(EQC).
 -include_lib("eqc/include/eqc.hrl").
 -endif.
--compile(export_all).
+-compile([export_all, nowarn_export_all]).
 -include_lib("eunit/include/eunit.hrl").
 -endif.
 
@@ -98,11 +98,6 @@ init() ->
             SoName = filename:join(Dir, "bitcask")
     end,
     erlang:load_nif(SoName, 0).
-
--ifdef(PULSE).
-set_pulse_pid(_Pid) ->
-    erlang:nif_error({error, not_loaded}).
--endif.
 
 %% ===================================================================
 %% Internal functions

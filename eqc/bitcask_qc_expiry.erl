@@ -26,8 +26,9 @@
 -include_lib("eqc/include/eqc.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include("include/bitcask.hrl").
+-include("stacktrace.hrl").
 
--compile(export_all).
+-compile([export_all, nowarn_export_all]).
 
 keys() ->
     eqc_gen:non_empty(list(eqc_gen:non_empty(binary()))).
@@ -88,7 +89,7 @@ prop_expiry() ->
                          choose(1,10), choose(1, 10), choose(5, 50), choose(5,128)},
                         ?IMPLIES(true,
                                  begin
-                                     Dirname = "/tmp/bc.prop.expiry",
+                                     Dirname = filename:join(?TEST_FILEPATH, "bc.prop.expiry"),
                                      ?cmd("rm -rf " ++ Dirname),
 
                                      %% Initialize how many ticks each operation will
@@ -144,9 +145,9 @@ prop_expiry() ->
                                                  true
                                          end
                                      catch
-                                         X:Y ->
+                                         ?_exception_(X, Y, StackToken) ->
                                              io:format(user, "exception: ~p ~p @ ~p\n",
-                                                       [X,Y, erlang:get_stacktrace()]),
+                                                       [X,Y, ?_get_stacktrace_(StackToken)]),
                                              test_exception
                                      after
                                          bitcask:close(Bref)
