@@ -67,7 +67,21 @@
          %% Data expiration can be caused by setting this to a
          %% positive value.  If so, items older than the value
          %% will be discarded.
-         {expiry_secs, -1}
+         {expiry_secs, -1},
 
+         %% Toggles tstamp expiry on / off. Certain use cases require that we do
+         %% not expire keys automatically. Setting as false will cause bitcask to
+         %% ignore a key's tstamp expiry and not merge / reap it.
+         {tstamp_expire_enabled, true},
+         %% Determines the default behaviour of expired keys. If tstamp_expiry_enabled
+         %% is toggled, by default any expired keys will always return not_found.
+         %% However, it might be desirable to retrieve these keys, in which case,
+         %% setting the false will cause them to be returned.
+         {not_found_expired, true},
+         %% Determines the default behaviour of expiring keys. In some instances
+         %% it may be desirable to exclude expiring keys from certain operations,
+         %% such as folds. The default is false, in which expiring keys will always
+         %% be returned.
+         {not_found_expiring, false}
         ]}
  ]}.
