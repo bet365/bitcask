@@ -90,7 +90,10 @@
                    read_write_p = 0 :: integer(),    % integer() avoids atom -> NIF
                    % What tombstone style to write, for testing purposes only.
                    % 0 = old style without file id, 2 = new style with file id
-                   tombstone_version = 2 :: 0 | 2
+                   tombstone_version = 2 :: 0 | 2,
+                   tstamp_expire_enabled :: boolean() | undefined,
+                   not_found_expired :: boolean() | undefined,
+                   not_found_expiring :: boolean() | undefined
                   }).
 
 -ifdef(namespaced_types).
@@ -115,7 +118,10 @@
                   decode_disk_key_fun :: function(),
                   read_write_p :: integer(),    % integer() avoids atom -> NIF
                   opts :: list(),
-                  delete_files :: [#filestate{}]}).
+                  delete_files :: [#filestate{}],
+                  tstamp_expire_enabled :: boolean() | undefined,
+                  not_found_expired :: boolean() | undefined,
+                  not_found_expiring :: boolean() | undefined}).
 
 %% A bitcask is a directory containing:
 %% * One or more data files - {integer_timestamp}.bitcask.data
@@ -163,12 +169,17 @@ open(Dirname, Opts) ->
     %% Type of tombstone to write, for testing.
     TombstoneVersion = get_opt(tombstone_version, Opts),
 
+    TstampExpireEnabled = get_opt(tstamp_expire_enabled, Opts),
+    NotFoundExpired = get_opt(not_found_expired, Opts),
+    NotFoundExpiring = get_opt(not_found_expiring, Opts),
+
     %% Loop and wait for the keydir to come available.
     ReadWriteP = WritingFile /= undefined,
     ReadWriteI = case ReadWriteP of true  -> 1;
                                     false -> 0
                  end,
-    case init_keydir(Dirname, WaitTime, ReadWriteP, DecodeDiskKeyFun) of
+    case init_keydir(Dirname, WaitTime, ReadWriteP, DecodeDiskKeyFun, TstampExpireEnabled,
+                    NotFoundExpired, NotFoundExpiring) of
         {ok, KeyDir, ReadFiles} ->
             %% Ensure that expiry_secs is in Opts and not just application env
             ExpOpts = [{expiry_secs,get_opt(expiry_secs,Opts)}|Opts],
@@ -184,7 +195,10 @@ open(Dirname, Opts) ->
                                        encode_disk_key_fun = EncodeDiskKeyFun,
                                        decode_disk_key_fun = DecodeDiskKeyFun,
                                        tombstone_version = TombstoneVersion,
-                                       read_write_p = ReadWriteI}),
+                                       read_write_p = ReadWriteI,
+                                       tstamp_expire_enabled = TstampExpireEnabled,
+                                       not_found_expired = NotFoundExpired,
+                                       not_found_expiring = NotFoundExpiring}),
             Ref;
         {error, Reason} ->
             {error, Reason}
@@ -247,19 +261,37 @@ get(Ref, Key, TryNum) ->
         not_found ->
             not_found;
         E when is_record(E, bitcask_entry) ->
-            case E#bitcask_entry.tstamp < expiry_time(State#bc_state.opts) orelse
-                 is_key_expired(E#bitcask_entry.tstamp_expire) of
+            IsKeyExpired = is_key_expired(E#bitcask_entry.tstamp_expire,
+                           State#bc_state.not_found_expired, State#bc_state.not_found_expiring),
+            %% Check if the key is expired according to global TTL or tstamp expiry.
+            %% If the tstamp expiry is true (key has expired), check if we should
+            %% return the key anyway as per not_found_expired. If tstamp expiry
+            %% has been turned on, and then toggled off, this determines what the
+            %% behaviour of already expired keys should be - which depends on the 
+            %% reasoning for disabling tstamp expiry. It may be the case that we
+            %% have turned tstamp expiry off and do not want to honour the expired 
+            %% keys.
+            case E#bitcask_entry.tstamp < expiry_time(State#bc_state.opts) 
+                 orelse IsKeyExpired of
                 true ->
-                    %% Expired entry; remove from keydir
-                    case bitcask_nifs:keydir_remove(State#bc_state.keydir, Key,
-                                                    E#bitcask_entry.tstamp,
-                                                    E#bitcask_entry.file_id,
-                                                    E#bitcask_entry.offset) of
-                        ok ->
-                            not_found;
-                        already_exists ->
-                            % Updated since last read, try again.
-                            get(Ref, Key, TryNum-1)
+                    %% Only remove the expired key from the keydir if tstamp
+                    %% expiry is enabled. Otherwise, return not_found and leave
+                    %% it alone.
+                    case State#bc_state.tstamp_expire_enabled of
+                        true ->
+                            %% Expired entry; remove from keydir
+                            case bitcask_nifs:keydir_remove(State#bc_state.keydir, Key,
+                                                            E#bitcask_entry.tstamp,
+                                                            E#bitcask_entry.file_id,
+                                                            E#bitcask_entry.offset) of
+                                ok ->
+                                    not_found;
+                                already_exists ->
+                                    % Updated since last read, try again.
+                                    get(Ref, Key, TryNum-1)
+                            end;
+                        false ->
+                            not_found
                     end;
                 false ->
                     %% HACK: Use a fully-qualified call to get_filestate/2 so that
@@ -359,10 +391,12 @@ fold_keys(Ref, Fun, Acc0, Opts) ->
     RealFun = fun(BCEntry, Acc) ->
         Key = BCEntry#bitcask_entry.key,
         TTLExpired = BCEntry#bitcask_entry.tstamp < ExpiryTime,
-        TStampExpired = BCEntry#bitcask_entry.tstamp_expire,
-        IsKeyExpired =
-            ttl_expired_or_key(TTLExpired, TStampExpired, Opts),
-        case IsKeyExpired of
+        NotFoundExpired = get_opt(not_found_expired, Opts, State#bc_state.not_found_expired),
+        NotFoundExpiring = get_opt(not_found_expiring, Opts, State#bc_state.not_found_expiring),
+
+        IsKeyExpired = is_key_expired(BCEntry#bitcask_entry.tstamp_expire, 
+                                      NotFoundExpired, NotFoundExpiring),
+        case TTLExpired orelse IsKeyExpired of
             true ->
                 Acc;
             false ->
@@ -383,18 +417,6 @@ fold_keys(Ref, Fun, Acc0, Opts) ->
         end
     end,
     bitcask_nifs:keydir_fold((get_state(Ref))#bc_state.keydir, RealFun, Acc0, MaxAge, MaxPuts).
-
-
-ttl_expired_or_key(TTLExpired, TstampExpired, Opts) ->
-    IsKeyExpired = is_key_expired(TstampExpired),
-    TTLExpired orelse IsKeyExpired orelse ignore_keys_with_expiry(TstampExpired, Opts).
-
-ignore_keys_with_expiry(0, _Opts) ->
-    false;
-ignore_keys_with_expiry(_, Opts) ->
-    proplists:get_value(ignore_tstamp_expire_keys, Opts, false).
-%% true = key is expired, ignore_tstamp_expire_keys is false.
-%% false = key is expired, ignore_tstamp_expire_keys is true
 
 %% @doc fold over all K/V pairs in a bitcask datastore.
 %% Fun is expected to take F(K,V,Acc0) -> Acc
@@ -433,10 +455,14 @@ fold(State, Fun, Acc0, Opts) ->
                                                                     [K0, KeyTxErr1]),
                                              Acc;
                                          #keyinfo{key = K1, tstamp_expire = TstampExpire} ->
-
                                              TTLExpired = TStamp < ExpiryTime,
-                                             IsKeyExpired = ttl_expired_or_key(TTLExpired, TstampExpire, Opts),
-                                             case IsKeyExpired of
+
+                                             NotFoundExpired = get_opt(not_found_expired, Opts, State#bc_state.not_found_expired),
+                                             NotFoundExpiring = get_opt(not_found_expiring, Opts, State#bc_state.not_found_expiring),
+
+                                             IsKeyExpired = is_key_expired(TstampExpire, 
+                                                                           NotFoundExpired, NotFoundExpiring),
+                                             case TTLExpired orelse IsKeyExpired of
                                                  true ->
                                                      Acc;
                                                  false ->
@@ -622,6 +648,10 @@ merge1(_Dirname, _Opts, [], []) ->
 merge1(Dirname, Opts, FilesToMerge0, ExpiredFiles) ->
     DecodeDiskKeyFun = get_decode_disk_key_fun(get_opt(decode_disk_key_fun, Opts)),
 
+    TstampExpireEnabled = get_opt(tstamp_expire_enabled, Opts),
+    NotFoundExpired = get_opt(not_found_expired, Opts),
+    NotFoundExpiring = get_opt(not_found_expiring, Opts),
+
     %% Try to lock for merging
     case bitcask_lockops:acquire(merge, Dirname) of
         {ok, Lock} ->
@@ -725,7 +755,10 @@ merge1(Dirname, Opts, FilesToMerge0, ExpiredFiles) ->
                       decode_disk_key_fun = DecodeDiskKeyFun,
                       read_write_p = 0,
                       opts = Opts,
-                      delete_files = []},
+                      delete_files = [],
+                      tstamp_expire_enabled = TstampExpireEnabled,
+                      not_found_expired = NotFoundExpired,
+                      not_found_expiring = NotFoundExpiring},
 
     %% Finally, start the merge process
     ExpiredFilesFinished = expiry_merge(InExpiredFiles, LiveKeyDir, DecodeDiskKeyFun, []),
@@ -1211,12 +1244,22 @@ get_opt(Key, Opts) ->
             Value
     end.
 
+get_opt(Key, Opts, Default) ->
+    case proplists:get_value(Key, Opts) of
+        undefined ->
+            Default;
+        Value ->
+            Value
+    end.
+
 put_state(Ref, State) ->
     erlang:put(Ref, State).
 
-scan_key_files([], _KeyDir, Acc, _CloseFile, _DecodeDiskKeyFun) ->
+scan_key_files([], _KeyDir, Acc, _CloseFile, _DecodeDiskKeyFun, _TstampExpireEnable,
+              _NotFoundExpired, _NotFoundExpiring) ->
     Acc;
-scan_key_files([Filename | Rest], KeyDir, Acc, CloseFile, DecodeDiskKeyFun) ->
+scan_key_files([Filename | Rest], KeyDir, Acc, CloseFile, DecodeDiskKeyFun, TstampExpireEnabled,
+              NotFoundExpired, NotFoundExpiring) ->
     %% Restrictive pattern matching below is intentional
     case bitcask_fileops:open_file(Filename) of
         {ok, File} ->
@@ -1246,7 +1289,7 @@ scan_key_files([Filename | Rest], KeyDir, Acc, CloseFile, DecodeDiskKeyFun) ->
                                 error_logger:error_msg("Invalid key on load ~p: ~p",
                                                        [K0, KeyTxErr]);
                             #keyinfo{key = K1, tstamp_expire = TstampExpire} ->
-                                case is_key_expired(TstampExpire, Now) of
+                                case is_key_expired(TstampExpire, NotFoundExpired, NotFoundExpiring, Now) andalso TstampExpireEnabled of
                                     false ->
                                         bitcask_nifs:keydir_put(KeyDir,
                                             K1,
@@ -1269,13 +1312,15 @@ scan_key_files([Filename | Rest], KeyDir, Acc, CloseFile, DecodeDiskKeyFun) ->
                true ->
                     ok
             end,
-            scan_key_files(Rest, KeyDir, [File | Acc], CloseFile, DecodeDiskKeyFun)
+            scan_key_files(Rest, KeyDir, [File | Acc], CloseFile, DecodeDiskKeyFun, 
+                           TstampExpireEnabled, NotFoundExpired, NotFoundExpiring)
     end.
 
 %%
 %% Initialize a keydir for a given directory.
 %%
-init_keydir(Dirname, WaitTime, ReadWriteModeP, DecodeDiskKeyFun) ->
+init_keydir(Dirname, WaitTime, ReadWriteModeP, DecodeDiskKeyFun, TstampExpireEnabled,
+           NotFoundExpired, NotFoundExpiring) ->
     %% Get the named keydir for this directory. If we get it and it's already
     %% marked as ready, that indicates another caller has already loaded
     %% all the data from disk and we can short-circuit scanning all the files.
@@ -1308,7 +1353,8 @@ init_keydir(Dirname, WaitTime, ReadWriteModeP, DecodeDiskKeyFun) ->
                    true ->
                         ok
                 end,
-                init_keydir_scan_key_files(Dirname, KeyDir, DecodeDiskKeyFun)
+                init_keydir_scan_key_files(Dirname, KeyDir, DecodeDiskKeyFun, TstampExpireEnabled,
+                                          NotFoundExpired, NotFoundExpiring)
             catch
                 _:Detail ->
                     {error, {purge_setuid_or_init_scan, Detail}}
@@ -1340,23 +1386,29 @@ init_keydir(Dirname, WaitTime, ReadWriteModeP, DecodeDiskKeyFun) ->
                 Value when is_integer(Value), Value =< 0 -> %% avoids 'infinity'!
                     {error, timeout};
                 _ ->
-                    init_keydir(Dirname, WaitTime - 100, ReadWriteModeP, DecodeDiskKeyFun)
+                    init_keydir(Dirname, WaitTime - 100, ReadWriteModeP, DecodeDiskKeyFun, TstampExpireEnabled,
+                               NotFoundExpired, NotFoundExpiring)
             end
     end.
 
-init_keydir_scan_key_files(Dirname, KeyDir, DecodeDiskKeyFun) ->
-    init_keydir_scan_key_files(Dirname, KeyDir, DecodeDiskKeyFun, ?DIABOLIC_BIG_INT).
+init_keydir_scan_key_files(Dirname, KeyDir, DecodeDiskKeyFun, TstampExpireEnabled,
+                          NotFoundExpired, NotFoundExpiring) ->
+    init_keydir_scan_key_files(Dirname, KeyDir, DecodeDiskKeyFun, ?DIABOLIC_BIG_INT, TstampExpireEnabled,
+                              NotFoundExpired, NotFoundExpiring).
 
-init_keydir_scan_key_files(_Dirname, _Keydir, _DecodeDiskKeyFun, 0) ->
+init_keydir_scan_key_files(_Dirname, _Keydir, _DecodeDiskKeyFun, 0, _TstampExpireEnabled,
+                          _NotFoundExpired, _NotFoundExpiring) ->
     %% If someone launches enough parallel merge operations to
     %% interfere with our attempts to scan this keydir for this many
     %% times, then we are just plain unlucky.  Or QuickCheck smites us
     %% from lofty Mt. Stochastic.
     {error, {init_keydir_scan_key_files, too_many_iterations}};
-init_keydir_scan_key_files(Dirname, KeyDir, DecodeDiskKeyFun, Count) ->
+init_keydir_scan_key_files(Dirname, KeyDir, DecodeDiskKeyFun, Count, TstampExpireEnabled,
+                          NotFoundExpired, NotFoundExpiring) ->
     try
         {SortedFiles, SetuidFiles} = readable_and_setuid_files(Dirname),
-        _ = scan_key_files(SortedFiles, KeyDir, [], true, DecodeDiskKeyFun),
+        _ = scan_key_files(SortedFiles, KeyDir, [], true, DecodeDiskKeyFun, TstampExpireEnabled,
+                          NotFoundExpired, NotFoundExpiring),
         %% There may be a setuid data file that has a larger tstamp name than
         %% any non-setuid data file.  Tell the keydir about it, so that we
         %% don't try to reuse that tstamp name.
@@ -1371,7 +1423,8 @@ init_keydir_scan_key_files(Dirname, KeyDir, DecodeDiskKeyFun, Count) ->
     catch ?_exception_(_X, _Y, StackToken) ->
             error_msg_perhaps("scan_key_files: ~p ~p @ ~p\n",
                               [_X, _Y, ?_get_stacktrace_(StackToken)]),
-            init_keydir_scan_key_files(Dirname, KeyDir, DecodeDiskKeyFun, Count - 1)
+            init_keydir_scan_key_files(Dirname, KeyDir, DecodeDiskKeyFun, Count - 1, 
+                                       TstampExpireEnabled, NotFoundExpired, NotFoundExpiring)
     end.
 
 get_filestate(FileId,
@@ -1452,7 +1505,9 @@ merge_files(#mstate {  dirname = Dirname,
     merge_files(State2#mstate { input_files = Rest }).
 
 merge_single_entry(KeyDirKey, DiskKey, V, Tstamp, TstampExpire, FileId, {_, _, Offset, _} = Pos, State) ->
-    case out_of_date(State, KeyDirKey, Tstamp, is_key_expired(TstampExpire), FileId, Pos, State#mstate.expiry_time,
+    IsKeyExpired = is_key_expired(TstampExpire, State#mstate.not_found_expired, State#mstate.not_found_expiring) 
+                   andalso State#mstate.tstamp_expire_enabled,
+    case out_of_date(State, KeyDirKey, Tstamp, IsKeyExpired, FileId, Pos, State#mstate.expiry_time,
                      false,
                      [State#mstate.live_keydir, State#mstate.del_keydir]) of
         true ->
@@ -2079,17 +2134,22 @@ get_decode_disk_key_fun(_) ->
 default_decode_disk_key_fun(Key) ->
     #keyinfo{key = Key}.
 
+is_key_expired(ExpireTstamp, NotFoundExpired, NotFoundExpiring) ->
+    is_key_expired(ExpireTstamp, NotFoundExpired, NotFoundExpiring, bitcask_time:tstamp()).
 
+is_key_expired(ExpireTstamp, NotFoundExpired, NotFoundExpiring, Now) ->
+    case expiration_status(ExpireTstamp, Now) of
+        expired -> 
+            NotFoundExpired;
+        expiring ->
+            NotFoundExpiring;
+        none -> 
+            false
+    end.
 
-
-is_key_expired(?DEFAULT_TSTAMP_EXPIRE) -> false;
-is_key_expired(ExpireTstamp) ->
-    Now = bitcask_time:tstamp(),
-    is_key_expired(ExpireTstamp, Now).
-
-is_key_expired(?DEFAULT_TSTAMP_EXPIRE, _Now) -> false;
-is_key_expired(ExpireTstamp, Now) when ExpireTstamp < Now -> true;
-is_key_expired(_ExpireTstamp, _Now) -> false.
+expiration_status(?DEFAULT_TSTAMP_EXPIRE, _Now) -> none;
+expiration_status(ExpireTstamp, Now) when ExpireTstamp < Now -> expired;
+expiration_status(_ExpireTstamp, _Now) -> expiring.
 
 -ifdef(TEST).
 error_msg_perhaps(_Fmt, _Args) ->
@@ -3946,8 +4006,11 @@ expired_keys_merge_1_test() ->
 %% -------------------------------------------------------------------------------------------------------------- %%
 %% TODO -> fold the tombstones and view the issue!
 fold_entries(Ref) ->
+    fold_entries(Ref, []).
+
+fold_entries(Ref, FoldOpts) ->
     FoldFun = fun(K, V, Acc) -> [{K,V} | Acc] end,
-    bitcask:fold(Ref, FoldFun, []).
+    bitcask:fold(Ref, FoldFun, [], FoldOpts).
 
 get_entries(Ref, List) ->
     [bitcask:get(Ref, K) || K <- List].
@@ -3965,7 +4028,10 @@ delete_entries(Ref, KeyValues) ->
         end, KeyValues).
 
 check_partial_merge(Ref, Expected) ->
-    RemainingKeysValues0 = fold_entries(Ref),
+    check_partial_merge(Ref, Expected, []).
+
+check_partial_merge(Ref, Expected, FoldOpts) ->
+    RemainingKeysValues0 = fold_entries(Ref, FoldOpts),
     RemainingKeysValues = lists:sort(RemainingKeysValues0),
     ExpectedKeyValues = lists:sort(Expected),
     ?assertEqual(ExpectedKeyValues, RemainingKeysValues).
@@ -4268,19 +4334,18 @@ filter_expired_keys_test() ->
     %% Put all entries
     put_entries(Ref0, KeyValues),
 
-    IgnoreExpiryTrue = [{ignore_tstamp_expire_keys, true}],
+    IgnoreExpiryTrue = [{not_found_expiring, true}],
     IgnoreExpiryFalse = [],
     Acc0  = [],
     FoldFun = fun(K,_,Acc) -> [K|Acc] end,
-
-    %% ignore_tstamp_expire_keys is true. So ignores all keys with expiry
+    %% not_foun_expiring is true. So ignores all keys with expiry
     ReturnedKeys1 = bitcask:fold(Ref0, FoldFun, Acc0, IgnoreExpiryTrue),
     %% result should be all the keys that that have no expiry.
     Expected1 = ExpectedKeysFun(NormalPuts1++NormalPuts2),
     ?assert(length(ReturnedKeys1) == length(Expected1)),
     ?assertEqual(lists:sort(ReturnedKeys1), lists:sort(Expected1)),
 
-    %% ignore_tstamp_expire_keys is false, so keys with an expiry is returned,
+    %% not_found_expiring is false, expiring keys will be returned.
     %% but the expired ones are not.
     ReturnedKeys2 = bitcask:fold(Ref0, FoldFun, Acc0, IgnoreExpiryFalse),
     %% result should be all the keys without expiry and with expiry, but not if actually expired
@@ -4290,5 +4355,202 @@ filter_expired_keys_test() ->
 
     bitcask:close(Ref0).
 
+expired_keys_opts_test() ->
+    Dir = "/tmp/bc.expired.keys.opts.0",
+    os:cmd(?FMT("rm -rf ~s", [Dir])),
+
+    BitcaskOpts =
+        [
+            {decode_disk_key_fun, decode_disk_key_fun()},
+            {encode_disk_key_fun, encode_disk_key_fun()},
+            {max_fold_age, -1},
+            {max_file_size, 9900},
+            {small_file_threshold, disabled},
+            {tstamp_expire_enabled, false},
+            {not_found_expired, false},
+            {not_found_expiring, false}
+        ],
+    Ref0 = bitcask:open(Dir, [read_write] ++ BitcaskOpts),
+
+    Value = <<0:64/integer-unit:8>>,
+    WithExpiry = bitcask_time:tstamp() + 1000,
+    WithExpired = bitcask_time:tstamp() - 1000,
+
+    NormalPuts1 = [ {<<N:32>>, Value, []} || N <- lists:seq(2000, 2050)],
+    NormalPuts2 = [ {<<N:32>>, Value, []} || N <- lists:seq(1, 300)],
+    ExpiryDeletes1 = [ {<<N:32>>, Value, [{?TSTAMP_EXPIRE_KEY, WithExpiry}]} || N <- lists:seq(2051,2100)],
+    ExpiryDeletes2 = [ {<<N:32>>, Value, [{?TSTAMP_EXPIRE_KEY, WithExpiry}]} || N <- lists:seq(301,600)],
+    ExpiredDeletes1 = [ {<<N:32>>, Value, [{?TSTAMP_EXPIRE_KEY, WithExpired}]} || N <- lists:seq(2101,2150)],
+    ExpiredDeletes2 = [ {<<N:32>>, Value, [{?TSTAMP_EXPIRE_KEY, WithExpired}]} || N <- lists:seq(601,900)],
+    %% put keys in random order
+
+    KeyValues = NormalPuts1++NormalPuts2++ExpiryDeletes1++ExpiryDeletes2++ExpiredDeletes1++ExpiredDeletes2,
+    ExpectedKeysFun = fun(KVs) -> [Key || {Key, _, _} <- KVs] end,
+
+    %% Put all entries
+    put_entries(Ref0, KeyValues),
+
+    %%FoldOpts = [{not_found_expired, false},
+    %%            {not_found_expiring, false}],
+    FoldOpts = [],
+    Acc0  = [],
+    FoldFun = fun(K,_,Acc) -> [K|Acc] end,
+
+    ReturnedKeys1 = bitcask:fold(Ref0, FoldFun, Acc0, FoldOpts),
+
+    Expected1 = ExpectedKeysFun(NormalPuts1++NormalPuts2++ExpiryDeletes1++ExpiryDeletes2++ExpiredDeletes1++ExpiredDeletes2),
+    ?assert(length(ReturnedKeys1) == length(Expected1)),
+    ?assertEqual(lists:sort(ReturnedKeys1), lists:sort(Expected1)),
+
+    bitcask:close(Ref0).
+
+expired_keys_opts_test_1() ->
+    Dir = "/tmp/bc.expired.keys.opts.1",
+    os:cmd(?FMT("rm -rf ~s", [Dir])),
+
+    BitcaskOpts =
+        [
+            {decode_disk_key_fun, decode_disk_key_fun()},
+            {encode_disk_key_fun, encode_disk_key_fun()},
+            {max_fold_age, -1},
+            {max_file_size, 9900},
+            {small_file_threshold, disabled},
+            {tstamp_expire_enabled, false},
+            {not_found_expired, true},
+            {not_found_expiring, false}
+        ],
+    Ref0 = bitcask:open(Dir, [read_write] ++ BitcaskOpts),
+
+    Value = <<0:64/integer-unit:8>>,
+    WithExpiry = bitcask_time:tstamp() + 1000,
+    WithExpired = bitcask_time:tstamp() - 1000,
+
+    NormalPuts1 = [ {<<N:32>>, Value, []} || N <- lists:seq(2000, 2050)],
+    NormalPuts2 = [ {<<N:32>>, Value, []} || N <- lists:seq(1, 300)],
+    ExpiryDeletes1 = [ {<<N:32>>, Value, [{?TSTAMP_EXPIRE_KEY, WithExpiry}]} || N <- lists:seq(2051,2100)],
+    ExpiryDeletes2 = [ {<<N:32>>, Value, [{?TSTAMP_EXPIRE_KEY, WithExpiry}]} || N <- lists:seq(301,600)],
+    ExpiredDeletes1 = [ {<<N:32>>, Value, [{?TSTAMP_EXPIRE_KEY, WithExpired}]} || N <- lists:seq(2101,2150)],
+    ExpiredDeletes2 = [ {<<N:32>>, Value, [{?TSTAMP_EXPIRE_KEY, WithExpired}]} || N <- lists:seq(601,900)],
+    %% put keys in random order
+
+    KeyValues = NormalPuts1++NormalPuts2++ExpiryDeletes1++ExpiryDeletes2++ExpiredDeletes1++ExpiredDeletes2,
+    ExpectedKeysFun = fun(KVs) -> [Key || {Key, _, _} <- KVs] end,
+
+    %% Put all entries
+    put_entries(Ref0, KeyValues),
+
+    %% retrieve all the keys - with tstamp_expire enabled, these would nomally be
+    %% removed from the keydir, but that should not be the case here.
+    _ = get_entries(Ref0, ExpectedKeysFun(KeyValues)),
+
+    %% set not_found_expired/expiring to false, which means we will return everything
+    %% regardless of whether it is expiring or expired.
+    FoldOpts = [{not_found_expired, false},
+                {not_found_expiring, false}],
+    Acc0  = [],
+    FoldFun = fun(K,_,Acc) -> [K|Acc] end,
+
+    ReturnedKeys1 = bitcask:fold(Ref0, FoldFun, Acc0, FoldOpts),
+
+    Expected1 = ExpectedKeysFun(KeyValues),
+    ?assert(length(ReturnedKeys1) == length(Expected1)),
+    ?assertEqual(lists:sort(ReturnedKeys1), lists:sort(Expected1)),
+
+    bitcask:close(Ref0).
+
+%% partial merges with disabling / enabling tstamp expiry and not_found opts.
+expired_keys_opts_partial_merge_1_test() ->
+    Dir = "/tmp/bc.expired.keys.opts.partial.merge.1",
+    os:cmd(?FMT("rm -rf ~s", [Dir])),
+    BitcaskOpts =
+        [
+            {decode_disk_key_fun, decode_disk_key_fun()},
+            {encode_disk_key_fun, encode_disk_key_fun()},
+            {max_fold_age, -1},
+            {max_file_size, 9900},
+            {small_file_threshold, disabled}
+        ],
+    %% open the first cask with tstamp_expire disabled. This means that nothing will
+    %% be expired during merging or on a get.
+    BitcaskOptsDisableTE = BitcaskOpts ++ [{tstamp_expire_enabled, false}],
+    Ref0 = bitcask:open(Dir, [read_write] ++ BitcaskOptsDisableTE),
+
+    Value = <<0:64/integer-unit:8>>,
+    Expired = bitcask_time:tstamp() - 1000,
+
+    NormalPuts1 = [ {<<N:32>>, Value, []} || N <- lists:seq(2000, 2050)],
+    NormalPuts2 = [ {<<N:32>>, Value, []} || N <- lists:seq(1, 1000)],
+    AllKeyValues1 = [X||{_,X} <- lists:sort([ {random:uniform(), N} || N <- NormalPuts1])],
+    AllKeyValues2 = [X||{_,X} <- lists:sort([ {random:uniform(), N} || N <- NormalPuts2])],
+    ExpiredDeletes2 = [ {<<N:32>>, Value, [{?TSTAMP_EXPIRE_KEY, Expired}]} || N <- lists:seq(1,400)],
+    ExpiredDeletes1 = [ {<<N:32>>, Value, [{?TSTAMP_EXPIRE_KEY, Expired}]} || N <- lists:seq(2000,2025)],
+
+    AllKeys = [Key || {Key, _, _} <- AllKeyValues1 ++ AllKeyValues2],
+
+    Expected = [ {<<N:32>>, Value} || N <- lists:seq(1, 1000) ++ lists:seq(2000, 2050)],
+
+    %% file 1
+    put_entries(Ref0, AllKeyValues1),
+    put_entries(Ref0, ExpiredDeletes1),
+    %% file 2 -> 10
+    put_entries(Ref0, AllKeyValues2),
+    %% file 11 -> 15
+    put_entries(Ref0, ExpiredDeletes2),
+
+    %% preform gets on all objects to remove them from keydir
+    _ = get_entries(Ref0, AllKeys),
+
+    FilesToMerge1 = [begin Dir++"/"++integer_to_list(X)++".bitcask.data" end || X <- lists:seq(11, 15) ++ [1]],
+    bitcask:merge(Dir, BitcaskOptsDisableTE, FilesToMerge1),
+    check_partial_merge(Ref0, Expected, [{not_found_expired, false}]),
+
+    %% preform gets on all objects to remove them from keydir
+    _ = get_entries(Ref0, AllKeys),
+
+    bitcask:close(Ref0),
+    Ref1 = bitcask:open(Dir, [read_write] ++ BitcaskOptsDisableTE),
+    check_partial_merge(Ref1, Expected, [{not_found_expired, false}]),
+
+    %% preform gets on all objects to remove them from keydir
+    _ = get_entries(Ref1, AllKeys),
+
+    %% return all the keys in the fold - choose to ignore the expired status of
+    %% some keys.
+    FilesToMerge2 = [begin Dir++"/"++integer_to_list(X)++".bitcask.data" end || X <- lists:seq(2, 10)],
+    bitcask:merge(Dir, BitcaskOptsDisableTE, FilesToMerge2),
+    check_partial_merge(Ref1, Expected, [{not_found_expired, false}]),
+
+    %% return just the non expired keys - this time pass the not_found_expired opt
+    %% into the fold.
+    Expected1 = [ {<<N:32>>, Value} || N <- lists:seq(401, 1000) ++ lists:seq(2026, 2050)],
+    check_partial_merge(Ref1, Expected1, [{not_found_expired, true}]),
+
+    bitcask:close(Ref1),
+
+    %% re open the casek without disabling tstamp_expire
+    Ref2 = bitcask:open(Dir, [read_write] ++ BitcaskOpts),
+    
+    %% preform gets on all objects to remove them from keydir
+    _ = get_entries(Ref2, AllKeys),
+
+    %% this time we only expect to have the non-deleted keys, since we have opened
+    %% the cask with {tstamp_expire_enabled, true} & {not_found_expired, true} (default).
+    Expected1 = [ {<<N:32>>, Value} || N <- lists:seq(401, 1000) ++ lists:seq(2026, 2050)],
+    FilesToMerge3 = [filename:join([Dir, F]) || F <- filelib:wildcard("*.data", Dir)],
+    bitcask:merge(Dir, BitcaskOpts, FilesToMerge3),
+    check_partial_merge(Ref2, Expected1, []),
+
+    bitcask:close(Ref2).
+
+encode_disk_key_fun() ->
+    fun(<<K/binary>>, Opts) ->
+        TStampExpire = proplists:get_value(?TSTAMP_EXPIRE_KEY, Opts, 0),
+        <<TStampExpire:32/integer, K/binary>>
+    end.
+
+decode_disk_key_fun() ->
+    fun(<<TStampExpire:32/integer, K/binary>>) ->
+            #keyinfo{key = K, tstamp_expire = TStampExpire}
+    end.
 
 -endif.
