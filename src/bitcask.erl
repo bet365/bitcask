@@ -1270,6 +1270,7 @@ scan_key_files([Filename | Rest], KeyDir, Acc, CloseFile, DecodeDiskKeyFun, Tsta
             %% tombstones or data errors.  Otherwise we risk of
             %% reusing the file id for new data.
             _ = bitcask_nifs:increment_file_id(KeyDir, FileTstamp),
+            Now = bitcask_time:tstamp(),
             F = fun({tombstone, K0}, _Tstamp, {_Offset, _TotalSz}, _) ->
                         K = try DecodeDiskKeyFun(K0) catch TxErr -> {key_tx_error, TxErr} end,
                         case K of
@@ -1288,7 +1289,7 @@ scan_key_files([Filename | Rest], KeyDir, Acc, CloseFile, DecodeDiskKeyFun, Tsta
                                 error_logger:error_msg("Invalid key on load ~p: ~p",
                                                        [K0, KeyTxErr]);
                             #keyinfo{key = K1, tstamp_expire = TstampExpire} ->
-                                case is_key_expired(TstampExpire, NotFoundExpired, NotFoundExpiring) andalso TstampExpireEnabled of
+                                case is_key_expired(TstampExpire, NotFoundExpired, NotFoundExpiring, Now) andalso TstampExpireEnabled of
                                     false ->
                                         bitcask_nifs:keydir_put(KeyDir,
                                             K1,
@@ -2134,7 +2135,10 @@ default_decode_disk_key_fun(Key) ->
     #keyinfo{key = Key}.
 
 is_key_expired(ExpireTstamp, NotFoundExpired, NotFoundExpiring) ->
-    case expiration_status(ExpireTstamp, bitcask_time:tstamp()) of
+    is_key_expired(ExpireTstamp, NotFoundExpired, NotFoundExpiring, bitcask_time:tstamp()).
+
+is_key_expired(ExpireTstamp, NotFoundExpired, NotFoundExpiring, Now) ->
+    case expiration_status(ExpireTstamp, Now) of
         expired -> 
             NotFoundExpired;
         expiring ->
